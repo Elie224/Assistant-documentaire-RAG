@@ -44,3 +44,5 @@ pytest>=8.0
 
 # --- Optional semantic embeddings (downloaded on first use) ---
 sentence-transformers>=3.0.0 ; python_version < "3.13"
+# --- Hybrid search ---
+rank-bm25>=0.2.2

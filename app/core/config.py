@@ -34,6 +34,9 @@ class Settings(BaseSettings):
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     )
 
+    hybrid_search: bool = Field(default=True)
+    bm25_weight: float = Field(default=0.4, ge=0.0, le=1.0)
+
     vector_store: Literal["chroma", "faiss"] = "chroma"
     chroma_dir: Path = Path("./data/index/chroma")
     faiss_dir: Path = Path("./data/index/faiss")
@@ -65,6 +68,11 @@ class Settings(BaseSettings):
     def index_dir(self) -> Path:
         base = self.chroma_dir if self.vector_store == "chroma" else self.faiss_dir
         return self.project_path(base) / self.rag_engine
+
+    @property
+    def isolated_index_dir(self) -> Path:
+        """Chemin d'index incluant moteur, vector store et provider d'embeddings."""
+        return self.index_dir / self.embed_provider
 
     @property
     def uploads_dir(self) -> Path:

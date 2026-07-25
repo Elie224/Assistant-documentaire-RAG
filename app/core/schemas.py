@@ -18,6 +18,7 @@ class SourceChunk(BaseModel):
     page: int | None = None
     score: float | None = None
     preview: str
+    content: str = ""
 
 
 class ChatResponse(BaseModel):

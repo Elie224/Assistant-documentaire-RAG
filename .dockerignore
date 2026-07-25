@@ -1,0 +1,12 @@
+.venv
+.uv-cache
+.uv-python
+__pycache__
+.pytest_cache
+.git
+.env
+data/index/*
+!data/index/.gitkeep
+data/raw/*
+!data/raw/.gitkeep
+.streamlit

@@ -1,0 +1,35 @@
+services:
+  api:
+    build: .
+    image: clairdoc/api:latest
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-local-lite}
+      VECTOR_STORE: ${VECTOR_STORE:-chroma}
+      RAG_API_KEY: ${RAG_API_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - rag-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  ui:
+    image: clairdoc/api:latest
+    command: ["streamlit", "run", "app/ui.py", "--server.address", "0.0.0.0", "--server.port", "8501", "--server.headless", "true"]
+    environment:
+      RAG_API_URL: http://api:8000
+      RAG_UI_API_KEY: ${RAG_UI_API_KEY:-}
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+    volumes:
+      - rag-data:/app/data
+
+volumes:
+  rag-data:

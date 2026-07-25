@@ -151,6 +151,22 @@ pytest -q
 ```
 
 Les tests unitaires n'appellent ni OpenAI ni Claude. La validation réelle de l'ingestion et du chat nécessite le fournisseur configuré dans `.env`. Une CI GitHub Actions exécute la suite à chaque push.
+
+## Déploiement Docker
+
+```bash
+docker compose up --build
+```
+
+Les services `api` (FastAPI) et `ui` (Streamlit) partagent un volume `rag-data` pour la persistance des index et des uploads. Configurez les variables d'environnement dans un fichier `.env` au même niveau que `docker-compose.yml`.
+
+## Lockfile
+
+```bash
+uv pip freeze --python .venv/Scripts/python.exe > requirements.lock
+# ou
+pip freeze > requirements.lock
+```
 - LLM : `anthropic` · Embeddings : `embed_provider`
 | LLM : `llm_provider` · Embeddings : `embed_provider` |
 ## Sécurité

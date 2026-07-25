@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import os
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Iterable, Protocol
@@ -68,19 +71,52 @@ def _registry_path(index_dir: Path) -> Path:
     return index_dir / "indexed_files.json"
 
 
+_REGISTRY_LOCKS: dict[str, Lock] = {}
+_REGISTRY_LOCKS_GUARD = Lock()
+
+
+def _lock_for(index_dir: Path) -> Lock:
+    key = str(index_dir.resolve())
+    with _REGISTRY_LOCKS_GUARD:
+        lock = _REGISTRY_LOCKS.get(key)
+        if lock is None:
+            lock = Lock()
+            _REGISTRY_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _registry_transaction(index_dir: Path, max_wait: float = 5.0):
+    """Verrou court sur le registre avec écriture atomique."""
+    lock = _lock_for(index_dir)
+    if not lock.acquire(timeout=max_wait):
+        raise RuntimeError("Registre index occupé, réessayez.")
+    try:
+        registry = _load_registry(index_dir)
+        yield registry
+        _save_registry(index_dir, registry)
+    finally:
+        lock.release()
+
+
 def _load_registry(index_dir: Path) -> dict[str, list[str]]:
-    if not _registry_path(index_dir).exists():
+    path = _registry_path(index_dir)
+    if not path.exists():
         return {}
     try:
-        return json.loads(_registry_path(index_dir).read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def _save_registry(index_dir: Path, registry: dict[str, list[str]]) -> None:
-    _registry_path(index_dir).write_text(
+    target = _registry_path(index_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp = target.with_suffix(target.suffix + ".tmp")
+    temp.write_text(
         json.dumps(registry, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+    os.replace(temp, target)
 
 
 def _split_new_paths(
@@ -106,9 +142,9 @@ def _record_files(index_dir: Path, pairs: list[tuple[Path, str]]) -> None:
     if not pairs:
         return
     registry = _load_registry(index_dir)
-    for path, digest in pairs:
-        registry.setdefault(digest, []).append(path.name)
-    _save_registry(index_dir, registry)
+    with _registry_transaction(index_dir) as registry:
+        for path, digest in pairs:
+            registry.setdefault(digest, []).append(path.name)
 
 
 def _filter_sources(
@@ -138,16 +174,60 @@ class LangChainBackend:
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    def _base_dir(self) -> Path:
+        return self.settings.isolated_index_dir
+
+    def _ensure_dir(self) -> Path:
+        path = self._base_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _search(self, question: str, store) -> list[tuple]:
+        if self.settings.embed_provider == "local-lite":
+            vector_results = [
+                (doc, None)
+                for doc in store.similarity_search(question, k=self.settings.top_k)
+            ]
+        else:
+            try:
+                vector_results = store.similarity_search_with_relevance_scores(
+                    question, k=self.settings.top_k
+                )
+            except (NotImplementedError, ValueError):
+                vector_results = [
+                    (doc, None)
+                    for doc in store.similarity_search(question, k=self.settings.top_k)
+                ]
+        if not self.settings.hybrid_search or self.settings.vector_store != "chroma":
+            return vector_results
+        try:
+            candidate_pool = store.similarity_search(
+                question, k=max(self.settings.top_k * 4, 12)
+            )
+        except Exception:
+            return vector_results
+        try:
+            bm25_results = _bm25_search(question, candidate_pool, self.settings.top_k)
+        except Exception:
+            return vector_results
+        return _hybrid_retrieve(
+            question,
+            vector_results,
+            bm25_results,
+            self.settings.top_k,
+            self.settings.bm25_weight,
+        )
+
     def _store(self):
         from app.core.providers import get_langchain_embeddings
 
         embeddings = get_langchain_embeddings(self.settings)
-        index_dir = self.settings.index_dir
+        index_dir = self._base_dir()
         if self.settings.vector_store == "chroma":
             from langchain_chroma import Chroma
 
             return Chroma(
-                collection_name="rag_documents_v2",
+                collection_name="rag_documents",
                 persist_directory=str(index_dir),
                 embedding_function=embeddings,
             )
@@ -165,7 +245,7 @@ class LangChainBackend:
     def ingest(self, paths: list[Path]) -> IngestionResponse:
         from app.core.providers import get_langchain_embeddings
 
-        kept, pairs = _split_new_paths(paths, _load_registry(self.settings.index_dir))
+        kept, pairs = _split_new_paths(paths, _load_registry(self._base_dir()))
         if not kept:
             return IngestionResponse(
                 files=[],
@@ -178,7 +258,7 @@ class LangChainBackend:
         if not chunks:
             raise ValueError("Les documents ne contiennent aucun texte exploitable.")
 
-        index_dir = self.settings.index_dir
+        index_dir = self._ensure_dir()
         index_dir.mkdir(parents=True, exist_ok=True)
         if self.settings.vector_store == "chroma":
             store = self._store()
@@ -206,29 +286,20 @@ class LangChainBackend:
         from app.core.providers import get_langchain_llm
 
         store = self._store()
-        if self.settings.embed_provider == "local-lite":
-            documents = store.similarity_search(question, k=self.settings.top_k)
-            scored: list[tuple] = [(doc, None) for doc in documents]
-        else:
-            try:
-                scored = store.similarity_search_with_relevance_scores(
-                    question, k=self.settings.top_k
-                )
-            except (NotImplementedError, ValueError):
-                scored = [
-                    (doc, None)
-                    for doc in store.similarity_search(question, k=self.settings.top_k)
-                ]
+        scored = self._search(question, store)
 
         sources: list[SourceChunk] = []
-        for document, score in scored:
+        context_segments: list[str] = []
+        for position, (document, score) in enumerate(scored, start=1):
             text = document.page_content.strip()
+            context_segments.append(f"--- Extrait {position} ---\n{text}")
             sources.append(
                 SourceChunk(
                     source=str(document.metadata.get("source", "Document inconnu")),
                     page=_page_number(document.metadata),
                     score=round(float(score), 4) if score is not None else None,
                     preview=text[:500],
+                    content=text,
                 )
             )
         filtered = _filter_sources(
@@ -239,12 +310,8 @@ class LangChainBackend:
         if not filtered:
             return _no_answer_response(self.settings)
 
-        context_parts = [
-            f"--- Extrait {position} ---\n{source.preview}"
-            for position, source in enumerate(filtered, start=1)
-        ]
         prompt = SYSTEM_PROMPT.format(
-            context="\n\n".join(context_parts),
+            context="\n\n".join(context_segments[: len(filtered)]),
             history=_history_text(history),
             question=question,
         )
@@ -264,12 +331,20 @@ class LlamaIndexBackend:
     def __init__(self, settings: Settings):
         self.settings = settings
 
+    def _base_dir(self) -> Path:
+        return self.settings.isolated_index_dir
+
+    def _ensure_dir(self) -> Path:
+        path = self._base_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def _chroma_index(self, embed_model, create: bool = False):
         import chromadb
         from llama_index.core import StorageContext, VectorStoreIndex
         from llama_index.vector_stores.chroma import ChromaVectorStore
 
-        client = chromadb.PersistentClient(path=str(self.settings.index_dir))
+        client = chromadb.PersistentClient(path=str(self._base_dir()))
         collection = client.get_or_create_collection("rag_documents_v2")
         if collection.count() == 0 and not create:
             raise EmptyIndexError("Aucun index. Importez d'abord des documents.")
@@ -285,7 +360,7 @@ class LlamaIndexBackend:
         from llama_index.core import StorageContext, VectorStoreIndex, load_index_from_storage
         from llama_index.vector_stores.faiss import FaissVectorStore
 
-        index_dir = self.settings.index_dir
+        index_dir = self._base_dir()
         if (index_dir / "default__vector_store.json").exists():
             vector_store = FaissVectorStore.from_persist_dir(str(index_dir))
             storage_context = StorageContext.from_defaults(
@@ -316,7 +391,7 @@ class LlamaIndexBackend:
     def ingest(self, paths: list[Path]) -> IngestionResponse:
         from llama_index.core.schema import TextNode
 
-        kept, pairs = _split_new_paths(paths, _load_registry(self.settings.index_dir))
+        kept, pairs = _split_new_paths(paths, _load_registry(self._base_dir()))
         if not kept:
             return IngestionResponse(
                 files=[],
@@ -329,7 +404,7 @@ class LlamaIndexBackend:
         if not chunks:
             raise ValueError("Les documents ne contiennent aucun texte exploitable.")
 
-        self.settings.index_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_dir()
         index = self._index(create=True)
         nodes = [
             TextNode(text=chunk.page_content, metadata=dict(chunk.metadata))
@@ -337,8 +412,8 @@ class LlamaIndexBackend:
         ]
         index.insert_nodes(nodes)
         if self.settings.vector_store == "faiss":
-            index.storage_context.persist(persist_dir=str(self.settings.index_dir))
-        _record_files(self.settings.index_dir, pairs)
+            index.storage_context.persist(persist_dir=str(self._base_dir()))
+        _record_files(self._base_dir(), pairs)
         return IngestionResponse(
             files=[path.name for path in kept],
             chunks=len(chunks),
@@ -364,16 +439,19 @@ class LlamaIndexBackend:
         )
         response = query_engine.query(enriched_question)
         sources: list[SourceChunk] = []
-        for source_node in response.source_nodes:
+        context_segments: list[str] = []
+        for position, source_node in enumerate(response.source_nodes, start=1):
             metadata = source_node.node.metadata
             text = source_node.node.get_content().strip()
             score = source_node.score
+            context_segments.append(f"--- Extrait {position} ---\n{text}")
             sources.append(
                 SourceChunk(
                     source=str(metadata.get("source", "Document inconnu")),
                     page=_page_number(metadata),
                     score=round(float(score), 4) if score is not None else None,
                     preview=text[:500],
+                    content=text,
                 )
             )
         filtered = _filter_sources(
@@ -383,8 +461,15 @@ class LlamaIndexBackend:
         )
         if not filtered:
             return _no_answer_response(self.settings)
+        enriched = (
+            "Contexte documentaire à utiliser :\n"
+            + "\n\n".join(context_segments[: len(filtered)])
+            + "\n\n"
+            + enriched_question
+        )
+        rerun = query_engine.query(enriched)
         return ChatResponse(
-            answer=_humanize_answer(str(response)),
+            answer=_humanize_answer(str(rerun)),
             sources=filtered,
             engine=self.settings.rag_engine,
             vector_store=self.settings.vector_store,
@@ -409,3 +494,60 @@ class RagService:
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse:
         with self._lock:
             return self.backend.ask(question, history)
+import os
+from threading import Lock
+def _normalize_scores(pairs: list[tuple]) -> list[tuple]:
+    scores = [score for _, score in pairs if score is not None]
+    if not scores:
+        return pairs
+    lo, hi = min(scores), max(scores)
+    if hi - lo < 1e-9:
+        return [(doc, (score - lo) if score is not None else None) for doc, score in pairs]
+    return [
+        (doc, ((score - lo) / (hi - lo)) if score is not None else None)
+        for doc, score in pairs
+    ]
+
+
+def _bm25_search(
+    question: str, documents: list, top_k: int
+) -> list[tuple]:
+    from rank_bm25 import BM25Okapi
+
+    tokenized = [doc.page_content.lower().split() for doc in documents]
+    bm25 = BM25Okapi(tokenized)
+    tokens = question.lower().split()
+    scores = bm25.get_scores(tokens)
+    indexed = sorted(
+        enumerate(scores), key=lambda item: item[1], reverse=True
+    )[:top_k]
+    return [(documents[index], float(score)) for index, score in indexed if score > 0]
+
+
+def _hybrid_retrieve(
+    question: str,
+    vector_results: list[tuple],
+    bm25_results: list[tuple],
+    top_k: int,
+    bm25_weight: float,
+) -> list[tuple]:
+    seen: dict[str, tuple[float, dict | None]] = {}
+    vector_weight = 1.0 - bm25_weight
+    for doc, score in _normalize_scores(vector_results):
+        key = hashlib.sha1(doc.page_content.encode("utf-8")).hexdigest()
+        seen[key] = (
+            max(seen.get(key, (0.0, doc))[0], (score or 0.0) * vector_weight),
+            doc,
+        )
+    for doc, score in _normalize_scores(bm25_results):
+        key = hashlib.sha1(doc.page_content.encode("utf-8")).hexdigest()
+        if score is None:
+            continue
+        weighted = score * bm25_weight
+        if key in seen:
+            doc_existing = seen[key][1]
+            seen[key] = (max(seen[key][0], weighted), doc_existing)
+        else:
+            seen[key] = (weighted, doc)
+    ranked = sorted(seen.items(), key=lambda item: item[1][0], reverse=True)[:top_k]
+    return [(doc, score) for _, (score, doc) in ranked]
