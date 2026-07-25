@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     app_name: str = "Assistant RAG"
     rag_engine: Literal["langchain", "llamaindex"] = "langchain"
     llm_provider: Literal["anthropic", "openai", "ollama"] = "anthropic"
-    embed_provider: Literal["local", "openai", "ollama"] = "local"
+    embed_provider: Literal["semantic", "local-lite", "openai", "ollama"] = "local-lite"
 
     anthropic_api_key: SecretStr | None = None
     anthropic_model: str = "claude-sonnet-4-5"
@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     embed_model: str = "text-embedding-3-small"
     local_embed_dimension: int = Field(default=768, ge=64, le=4096)
+    local_semantic_model: str = (
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
 
     vector_store: Literal["chroma", "faiss"] = "chroma"
     chroma_dir: Path = Path("./data/index/chroma")
@@ -44,6 +47,10 @@ class Settings(BaseSettings):
 
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
+
+    api_key: SecretStr | None = None
+
+    api_key: SecretStr | None = None
 
     @model_validator(mode="after")
     def validate_chunking(self) -> "Settings":

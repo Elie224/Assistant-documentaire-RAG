@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from pathlib import Path
 from threading import Lock
-from typing import Protocol
+from typing import Iterable, Protocol
 
 from app.core.config import Settings, get_settings
 from app.core.documents import load_documents, split_documents
@@ -33,24 +35,103 @@ class RagBackend(Protocol):
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse: ...
 
 
-def _history_text(history: list[ChatMessage]) -> str:
+def _history_text(history: Iterable[ChatMessage]) -> str:
+    history = list(history)
     if not history:
         return "Aucun."
     return "\n".join(f"{message.role}: {message.content}" for message in history[-8:])
 
 
+_CITATION_PATTERN = re.compile(r"\s*\[(?:\d+(?:\s*[-,]\s*\d+)*)\]")
+_PUNCTUATION_SPACE = re.compile(r"\s+([.,;:!?])")
+
+
 def _humanize_answer(answer: str) -> str:
-    without_citations = re.sub(
-        r"\s*\[(?:\d+(?:\s*[-,]\s*\d+)*)\]",
-        "",
-        answer,
-    )
-    return re.sub(r"\s+([.,;:!?])", r"\1", without_citations).strip()
+    cleaned = _CITATION_PATTERN.sub("", answer)
+    return _PUNCTUATION_SPACE.sub(r"\1", cleaned).strip()
 
 
 def _page_number(metadata: dict) -> int | None:
     page = metadata.get("page")
     return int(page) + 1 if isinstance(page, int) else None
+
+
+def _file_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as input_file:
+        for block in iter(lambda: input_file.read(1 << 16), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _registry_path(index_dir: Path) -> Path:
+    return index_dir / "indexed_files.json"
+
+
+def _load_registry(index_dir: Path) -> dict[str, list[str]]:
+    if not _registry_path(index_dir).exists():
+        return {}
+    try:
+        return json.loads(_registry_path(index_dir).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_registry(index_dir: Path, registry: dict[str, list[str]]) -> None:
+    _registry_path(index_dir).write_text(
+        json.dumps(registry, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _split_new_paths(
+    paths: list[Path], registry: dict[str, list[str]]
+) -> tuple[list[Path], list[tuple[Path, str]]]:
+    """Return (kept paths, hash pairs) skipping already-indexed content."""
+    kept: list[Path] = []
+    pairs: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    for path in paths:
+        digest = _file_hash(path)
+        if digest in seen:
+            continue
+        seen.add(digest)
+        if path.name in registry.get(digest, []):
+            continue
+        kept.append(path)
+        pairs.append((path, digest))
+    return kept, pairs
+
+
+def _record_files(index_dir: Path, pairs: list[tuple[Path, str]]) -> None:
+    if not pairs:
+        return
+    registry = _load_registry(index_dir)
+    for path, digest in pairs:
+        registry.setdefault(digest, []).append(path.name)
+    _save_registry(index_dir, registry)
+
+
+def _filter_sources(
+    sources: list[SourceChunk], threshold: float, allow_unscored: bool
+) -> list[SourceChunk]:
+    result = []
+    for source in sources:
+        if source.score is None:
+            if allow_unscored:
+                result.append(source)
+            continue
+        if source.score >= threshold:
+            result.append(source)
+    return result
+
+
+def _no_answer_response(settings: Settings) -> ChatResponse:
+    return ChatResponse(
+        answer="Je ne trouve pas cette information dans les documents indexés.",
+        sources=[],
+        engine=settings.rag_engine,
+        vector_store=settings.vector_store,
+    )
 
 
 class LangChainBackend:
@@ -84,7 +165,15 @@ class LangChainBackend:
     def ingest(self, paths: list[Path]) -> IngestionResponse:
         from app.core.providers import get_langchain_embeddings
 
-        documents = load_documents(paths)
+        kept, pairs = _split_new_paths(paths, _load_registry(self.settings.index_dir))
+        if not kept:
+            return IngestionResponse(
+                files=[],
+                chunks=0,
+                engine=self.settings.rag_engine,
+                vector_store=self.settings.vector_store,
+            )
+        documents = load_documents(kept)
         chunks = split_documents(documents, self.settings)
         if not chunks:
             raise ValueError("Les documents ne contiennent aucun texte exploitable.")
@@ -105,8 +194,9 @@ class LangChainBackend:
                 store = FAISS.from_documents(chunks, embeddings)
             store.save_local(str(index_dir))
 
+        _record_files(index_dir, pairs)
         return IngestionResponse(
-            files=[path.name for path in paths],
+            files=[path.name for path in kept],
             chunks=len(chunks),
             engine=self.settings.rag_engine,
             vector_store=self.settings.vector_store,
@@ -116,40 +206,23 @@ class LangChainBackend:
         from app.core.providers import get_langchain_llm
 
         store = self._store()
-        if self.settings.embed_provider == "local":
-            results = [
-                (document, None)
-                for document in store.similarity_search(question, k=self.settings.top_k)
-            ]
+        if self.settings.embed_provider == "local-lite":
+            documents = store.similarity_search(question, k=self.settings.top_k)
+            scored: list[tuple] = [(doc, None) for doc in documents]
         else:
             try:
-                results = store.similarity_search_with_relevance_scores(
+                scored = store.similarity_search_with_relevance_scores(
                     question, k=self.settings.top_k
                 )
             except (NotImplementedError, ValueError):
-                results = [
-                    (document, None)
-                    for document in store.similarity_search(question, k=self.settings.top_k)
+                scored = [
+                    (doc, None)
+                    for doc in store.similarity_search(question, k=self.settings.top_k)
                 ]
 
-        filtered = [
-            (document, score)
-            for document, score in results
-            if score is None or score >= self.settings.score_threshold
-        ]
-        if not filtered:
-            return ChatResponse(
-                answer="Je ne trouve pas cette information dans les documents indexés.",
-                sources=[],
-                engine=self.settings.rag_engine,
-                vector_store=self.settings.vector_store,
-            )
-
-        context_parts = []
-        sources = []
-        for position, (document, score) in enumerate(filtered, start=1):
+        sources: list[SourceChunk] = []
+        for document, score in scored:
             text = document.page_content.strip()
-            context_parts.append(f"--- Extrait {position} ---\n{text}")
             sources.append(
                 SourceChunk(
                     source=str(document.metadata.get("source", "Document inconnu")),
@@ -158,7 +231,18 @@ class LangChainBackend:
                     preview=text[:500],
                 )
             )
+        filtered = _filter_sources(
+            sources,
+            self.settings.score_threshold,
+            allow_unscored=self.settings.embed_provider == "local-lite",
+        )
+        if not filtered:
+            return _no_answer_response(self.settings)
 
+        context_parts = [
+            f"--- Extrait {position} ---\n{source.preview}"
+            for position, source in enumerate(filtered, start=1)
+        ]
         prompt = SYSTEM_PROMPT.format(
             context="\n\n".join(context_parts),
             history=_history_text(history),
@@ -170,7 +254,7 @@ class LangChainBackend:
         )
         return ChatResponse(
             answer=_humanize_answer(raw_answer),
-            sources=sources,
+            sources=filtered,
             engine=self.settings.rag_engine,
             vector_store=self.settings.vector_store,
         )
@@ -186,7 +270,7 @@ class LlamaIndexBackend:
         from llama_index.vector_stores.chroma import ChromaVectorStore
 
         client = chromadb.PersistentClient(path=str(self.settings.index_dir))
-        collection = client.get_or_create_collection("rag_documents")
+        collection = client.get_or_create_collection("rag_documents_v2")
         if collection.count() == 0 and not create:
             raise EmptyIndexError("Aucun index. Importez d'abord des documents.")
         vector_store = ChromaVectorStore(chroma_collection=collection)
@@ -232,7 +316,15 @@ class LlamaIndexBackend:
     def ingest(self, paths: list[Path]) -> IngestionResponse:
         from llama_index.core.schema import TextNode
 
-        documents = load_documents(paths)
+        kept, pairs = _split_new_paths(paths, _load_registry(self.settings.index_dir))
+        if not kept:
+            return IngestionResponse(
+                files=[],
+                chunks=0,
+                engine=self.settings.rag_engine,
+                vector_store=self.settings.vector_store,
+            )
+        documents = load_documents(kept)
         chunks = split_documents(documents, self.settings)
         if not chunks:
             raise ValueError("Les documents ne contiennent aucun texte exploitable.")
@@ -246,9 +338,9 @@ class LlamaIndexBackend:
         index.insert_nodes(nodes)
         if self.settings.vector_store == "faiss":
             index.storage_context.persist(persist_dir=str(self.settings.index_dir))
-
+        _record_files(self.settings.index_dir, pairs)
         return IngestionResponse(
-            files=[path.name for path in paths],
+            files=[path.name for path in kept],
             chunks=len(chunks),
             engine=self.settings.rag_engine,
             vector_store=self.settings.vector_store,
@@ -271,7 +363,7 @@ class LlamaIndexBackend:
             f"Question: {question}"
         )
         response = query_engine.query(enriched_question)
-        sources = []
+        sources: list[SourceChunk] = []
         for source_node in response.source_nodes:
             metadata = source_node.node.metadata
             text = source_node.node.get_content().strip()
@@ -284,9 +376,16 @@ class LlamaIndexBackend:
                     preview=text[:500],
                 )
             )
+        filtered = _filter_sources(
+            sources,
+            self.settings.score_threshold,
+            allow_unscored=self.settings.embed_provider == "local-lite",
+        )
+        if not filtered:
+            return _no_answer_response(self.settings)
         return ChatResponse(
             answer=_humanize_answer(str(response)),
-            sources=sources,
+            sources=filtered,
             engine=self.settings.rag_engine,
             vector_store=self.settings.vector_store,
         )

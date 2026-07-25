@@ -2,11 +2,20 @@ from pathlib import Path
 
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
 
 from app.core.config import Settings
 from app.core.exceptions import UnsupportedDocumentError
 
+
+_MARKDOWN_HEADERS = [
+    ("#", "title"),
+    ("##", "section"),
+    ("###", "subsection"),
+]
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx"}
 
@@ -36,11 +45,30 @@ def load_documents(paths: list[Path]) -> list[Document]:
 
 
 def split_documents(documents: list[Document], settings: Settings) -> list[Document]:
-    splitter = RecursiveCharacterTextSplitter(
+    character_splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
         length_function=len,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
-    chunks = splitter.split_documents(documents)
+    header_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=_MARKDOWN_HEADERS,
+        strip_headers=False,
+    )
+
+    expanded: list[Document] = []
+    for document in documents:
+        is_markdown = Path(document.metadata.get("source", "")).suffix.lower() == ".md"
+        if is_markdown and "\n#" in document.page_content:
+            for piece in header_splitter.split_text(document.page_content):
+                expanded.append(
+                    Document(
+                        page_content=piece.page_content,
+                        metadata=dict(document.metadata) | dict(piece.metadata),
+                    )
+                )
+        else:
+            expanded.append(document)
+
+    chunks = character_splitter.split_documents(expanded)
     return [chunk for chunk in chunks if chunk.page_content.strip()]

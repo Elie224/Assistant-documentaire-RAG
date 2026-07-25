@@ -29,10 +29,14 @@ def get_langchain_llm(settings: Settings):
 
 
 def get_langchain_embeddings(settings: Settings):
-    if settings.embed_provider == "local":
-        from app.core.local_embeddings import LocalLangChainEmbeddings
+    if settings.embed_provider in {"semantic", "local-lite"}:
+        from app.core.local_embeddings import build_local_embeddings
 
-        return LocalLangChainEmbeddings(dimension=settings.local_embed_dimension)
+        return build_local_embeddings(
+            mode=settings.embed_provider,
+            model_name=settings.local_semantic_model,
+            dimension=settings.local_embed_dimension,
+        )
     if settings.embed_provider == "openai":
         from langchain_openai import OpenAIEmbeddings
 
@@ -78,10 +82,14 @@ def get_llamaindex_llm(settings: Settings):
 
 
 def get_llamaindex_embeddings(settings: Settings):
-    if settings.embed_provider == "local":
-        from app.core.local_embeddings import LocalLlamaIndexEmbedding
+    if settings.embed_provider in {"semantic", "local-lite"}:
+        from app.core.local_embeddings import build_llamaindex_embedding
 
-        return LocalLlamaIndexEmbedding(dimension=settings.local_embed_dimension)
+        return build_llamaindex_embedding(
+            mode=settings.embed_provider,
+            model_name=settings.local_semantic_model,
+            dimension=settings.local_embed_dimension,
+        )
     if settings.embed_provider == "openai":
         from llama_index.embeddings.openai import OpenAIEmbedding
 

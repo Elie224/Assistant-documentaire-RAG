@@ -1,5 +1,6 @@
 .env
 .venv/
+.github/.cache/
 .uv-cache/
 .uv-python/
 __pycache__/

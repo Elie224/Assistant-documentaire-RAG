@@ -41,3 +41,6 @@ tiktoken>=0.6
 
 # --- Tests ---
 pytest>=8.0
+
+# --- Optional semantic embeddings (downloaded on first use) ---
+sentence-transformers>=3.0.0 ; python_version < "3.13"
