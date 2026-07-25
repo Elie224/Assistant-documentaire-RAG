@@ -1,0 +1,12 @@
+.env
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.streamlit/
+data/raw/*
+!data/raw/.gitkeep
+data/index/*
+!data/index/.gitkeep
