@@ -1,5 +1,9 @@
 # Assistant documentaire RAG
 
+[![Tests](https://github.com/Elie224/Assistant-documentaire-RAG/actions/workflows/ci.yml/badge.svg)](https://github.com/Elie224/Assistant-documentaire-RAG/actions)
+[![Licence MIT](https://img.shields.io/badge/Licence-MIT-4c4dc7.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12-4c4dc7.svg)]()
+
 Un projet complet de **Retrieval-Augmented Generation** capable d'indexer des documents, de retrouver les passages pertinents et de produire une réponse sourcée en français.
 
 ## Fonctionnalités
@@ -7,7 +11,8 @@ Un projet complet de **Retrieval-Augmented Generation** capable d'indexer des do
 - import de fichiers PDF, DOCX, TXT et Markdown ;
 - découpage configurable avec chevauchement ;
 - génération avec Claude/Anthropic, OpenAI ou modèles locaux Ollama ;
-- embeddings OpenAI, Ollama ou locaux sans téléchargement ;
+- génération avec Claude/Anthropic, OpenAI ou modèles locaux Ollama ;
+- embeddings OpenAI, Ollama, sentence-transformers (`semantic`) ou hashing lexical local (`local-lite`) ;
 - orchestration interchangeable entre LangChain et LlamaIndex ;
 - stockage vectoriel persistant avec ChromaDB ou FAISS ;
 - API FastAPI documentée avec OpenAPI ;
@@ -45,17 +50,19 @@ Copy-Item .env.example .env
 
 ### Option A — Anthropic avec embeddings locaux
 
-Cette option n'utilise qu'une clé Anthropic. Claude produit les réponses et le moteur local calcule des vecteurs lexicaux normalisés, sans modèle supplémentaire à télécharger :
+Cette option n'utilise qu'une clé Anthropic. Le mode `local-lite` (par défaut) calcule des vecteurs lexicaux sans réseau, et le mode `semantic` télécharge un modèle `sentence-transformers` léger la première fois :
 
 ```dotenv
 RAG_ENGINE=langchain
 LLM_PROVIDER=anthropic
-EMBED_PROVIDER=local
+EMBED_PROVIDER=semantic
 ANTHROPIC_API_KEY=sk-ant-votre-cle
 ANTHROPIC_MODEL=claude-sonnet-4-5
-LOCAL_EMBED_DIMENSION=768
+LOCAL_SEMANTIC_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 VECTOR_STORE=chroma
 ```
+
+Pour un mode 100 % hors ligne, utilisez `EMBED_PROVIDER=local-lite` : aucune clé externe n'est nécessaire mais la recherche reste lexicale.
 
 ### Option B — OpenAI
 
@@ -143,4 +150,9 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/chat -ContentType appl
 pytest -q
 ```
 
-Les tests unitaires n'appellent ni OpenAI ni Ollama. La validation réelle de l'ingestion et du chat nécessite le fournisseur configuré dans `.env`.
+Les tests unitaires n'appellent ni OpenAI ni Claude. La validation réelle de l'ingestion et du chat nécessite le fournisseur configuré dans `.env`. Une CI GitHub Actions exécute la suite à chaque push.
+- LLM : `anthropic` · Embeddings : `embed_provider`
+| LLM : `llm_provider` · Embeddings : `embed_provider` |
+## Sécurité
+
+L'API supporte une clé partagée optionnelle. Définissez `RAG_API_KEY` dans `.env` puis passez l'en-tête `X-API-Key` à chaque requête. L'interface Streamlit utilise automatiquement la clé si la variable `RAG_UI_API_KEY` est définie dans l'environnement de lancement.

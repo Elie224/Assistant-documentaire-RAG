@@ -27,3 +27,17 @@ def test_unsupported_extension_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(UnsupportedDocumentError):
         load_documents([document_path])
+
+
+def test_markdown_document_keeps_section_headers(tmp_path: Path) -> None:
+    document_path = tmp_path / "guide.md"
+    document_path.write_text(
+        "# Politique interne\n\n## Avantages\n\nL'allocation est de 250 euros par an.\n",
+        encoding="utf-8",
+    )
+    settings = Settings(chunk_size=200, chunk_overlap=20)
+
+    chunks = split_documents(load_documents([document_path]), settings)
+
+    assert any("Avantages" in chunk.page_content for chunk in chunks)
+    assert any("250 euros" in chunk.page_content for chunk in chunks)

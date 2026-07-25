@@ -1,10 +1,13 @@
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
+
+def _load_settings() -> Settings:
+    return get_settings()
 from app.core.documents import SUPPORTED_EXTENSIONS
 from app.core.exceptions import RagError
 from app.core.rag import RagService
@@ -20,8 +23,19 @@ settings = get_settings()
 app = FastAPI(
     title=settings.app_name,
     description="API d'assistant documentaire avec LangChain ou LlamaIndex.",
-    version="1.0.0",
+    version="1.1.0",
 )
+
+
+def require_api_key(
+    x_api_key: str | None = Header(default=None),
+    active_settings: Settings = Depends(_load_settings),
+) -> None:
+    if active_settings.api_key is None or not active_settings.api_key.get_secret_value():
+        return
+    expected = active_settings.api_key.get_secret_value()
+    if not x_api_key or x_api_key != expected:
+        raise HTTPException(401, "Clé API invalide ou manquante.")
 
 
 @lru_cache
@@ -68,7 +82,7 @@ def root() -> dict[str, str]:
 
 
 @app.get("/health", response_model=HealthResponse)
-def health() -> HealthResponse:
+def health(_: None = Depends(require_api_key)) -> HealthResponse:
     return HealthResponse(
         status="ok",
         engine=settings.rag_engine,
@@ -80,6 +94,7 @@ def health() -> HealthResponse:
 
 @app.post("/documents/ingest", response_model=IngestionResponse)
 async def ingest_documents(
+    _: None = Depends(require_api_key),
     files: list[UploadFile] = File(...),
 ) -> IngestionResponse:
     if not files:
@@ -94,7 +109,7 @@ async def ingest_documents(
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(request: ChatRequest, _: None = Depends(require_api_key)) -> ChatResponse:
     try:
         return await run_in_threadpool(
             get_rag_service().ask,

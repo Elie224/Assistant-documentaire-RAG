@@ -7,7 +7,14 @@ from llama_index.core.embeddings import MockEmbedding
 from llama_index.core.llms import MockLLM
 
 from app.core.config import Settings
-from app.core.rag import LangChainBackend, LlamaIndexBackend
+from app.core.rag import (
+    LangChainBackend,
+    LlamaIndexBackend,
+    _file_hash,
+    _load_registry,
+    _record_files,
+    _split_new_paths,
+)
 
 
 class ConstantEmbeddings(Embeddings):
@@ -77,3 +84,15 @@ def test_llamaindex_backend_ingests_and_answers(
     assert ingestion.chunks == 1
     assert response.answer
     assert response.sources[0].source == "support.txt"
+
+
+def test_duplicate_files_are_skipped(tmp_path: Path) -> None:
+    source = tmp_path / "policy.txt"
+    source.write_text("allocation", encoding="utf-8")
+    registry = _load_registry(tmp_path)
+    kept, pairs = _split_new_paths([source], registry)
+    assert kept and pairs
+    _record_files(tmp_path, pairs)
+    again, _ = _split_new_paths([source], _load_registry(tmp_path))
+    assert not again
+    assert _file_hash(source)

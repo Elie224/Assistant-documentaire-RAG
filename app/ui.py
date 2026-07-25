@@ -1,5 +1,7 @@
 import os
 
+import os
+
 import requests
 import streamlit as st
 
@@ -341,6 +343,7 @@ def api_error(response: requests.Response) -> str:
 def get_api_health() -> tuple[bool, dict]:
     try:
         response = requests.get(f"{API_URL}/health", timeout=3)
+        response = requests.get(f"{API_URL}/health", timeout=3, headers=api_headers())
         response.raise_for_status()
         return True, response.json()
     except requests.RequestException:
@@ -464,6 +467,7 @@ with st.sidebar:
                     f"{API_URL}/documents/ingest",
                     files=payload,
                     timeout=300,
+                    headers=api_headers(),
                 )
                 if response.ok:
                     result = response.json()
@@ -580,6 +584,7 @@ if question:
                     f"{API_URL}/chat",
                     json={"question": question, "history": history},
                     timeout=180,
+                    headers=api_headers(),
                 )
                 if response.ok:
                     result = response.json()
@@ -596,3 +601,6 @@ if question:
                     st.error(f"Je n'ai pas pu répondre : {api_error(response)}")
             except requests.RequestException as error:
                 st.error(f"La connexion avec l'assistant a été interrompue : {error}")
+def api_headers() -> dict[str, str]:
+    key = os.getenv("RAG_UI_API_KEY")
+    return {"X-API-Key": key} if key else {}
