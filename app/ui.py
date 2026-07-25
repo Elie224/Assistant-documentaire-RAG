@@ -1,12 +1,17 @@
 import os
 
-import os
-
 import requests
 import streamlit as st
 
 
 API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+def api_headers() -> dict[str, str]:
+    key = os.getenv("RAG_UI_API_KEY")
+    return {"X-API-Key": key} if key else {}
+
+
 SUGGESTIONS = [
     ("💶", "Quel est le montant de l'allocation annuelle ?"),
     ("🕘", "Quels sont les horaires du support informatique ?"),
@@ -601,6 +606,3 @@ if question:
                     st.error(f"Je n'ai pas pu répondre : {api_error(response)}")
             except requests.RequestException as error:
                 st.error(f"La connexion avec l'assistant a été interrompue : {error}")
-def api_headers() -> dict[str, str]:
-    key = os.getenv("RAG_UI_API_KEY")
-    return {"X-API-Key": key} if key else {}
