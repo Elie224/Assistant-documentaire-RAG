@@ -1,4 +1,5 @@
 import os
+import hashlib
 
 import requests
 import streamlit as st
@@ -539,12 +540,51 @@ with st.sidebar:
         disabled=not uploads or not api_online,
         width="stretch",
     ):
+        upload_payloads = []
+        selected_digests: set[str] = set()
+        for upload in uploads:
+            content = upload.getvalue()
+            selected_digests.add(hashlib.sha256(content).hexdigest())
+            upload_payloads.append((upload.name, content, upload.type))
+
         payload = [
-            ("files", (upload.name, upload.getvalue(), upload.type)) for upload in uploads
+            ("files", (name, content, content_type))
+            for name, content, content_type in upload_payloads
         ]
         with st.status("Préparation de votre base documentaire…", expanded=True) as status:
-            st.write("Lecture et découpage des documents")
+            st.write("Synchronisation de la base documentaire")
             try:
+                listed = requests.get(
+                    f"{API_URL}/documents",
+                    timeout=30,
+                    headers=api_headers(),
+                )
+                if not listed.ok:
+                    status.update(label="Synchronisation interrompue", state="error")
+                    st.error(api_error(listed))
+                    st.stop()
+
+                existing_documents = listed.json().get("documents", [])
+                stale_document_ids = [
+                    doc.get("document_id")
+                    for doc in existing_documents
+                    if doc.get("document_id") not in selected_digests
+                ]
+
+                for document_id in stale_document_ids:
+                    if not document_id:
+                        continue
+                    deletion = requests.delete(
+                        f"{API_URL}/documents/{document_id}",
+                        timeout=60,
+                        headers=api_headers(),
+                    )
+                    if not deletion.ok:
+                        status.update(label="Nettoyage interrompu", state="error")
+                        st.error(api_error(deletion))
+                        st.stop()
+
+                st.write("Lecture et découpage des documents")
                 response = requests.post(
                     f"{API_URL}/documents/ingest",
                     files=payload,
