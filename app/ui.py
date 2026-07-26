@@ -387,6 +387,9 @@ def get_api_health() -> tuple[bool, dict]:
         response = requests.get(
             f"{API_URL}/health", timeout=3, headers=api_headers()
         )
+        if response.status_code == 401:
+            # API is reachable but protected; UI can still show it as online.
+            return True, {"auth_required": True}
         response.raise_for_status()
         return True, response.json()
     except requests.RequestException:
@@ -460,24 +463,38 @@ with st.sidebar:
     )
 
     if api_online:
+        if config.get("auth_required"):
+            st.markdown(
+                """
+                <div class="connection-card">
+                    <div class="status-dot online"></div>
+                    <div>
+                        <div class="connection-title">API disponible</div>
+                        <div class="connection-meta">Authentification requise (RAG_UI_API_KEY)</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
         engine_value = config.get("engine", "langchain")
         store_value = config.get("vector_store", "chroma")
         llm_value = config.get("llm_provider", "anthropic")
         engine = provider_names.get(engine_value, engine_value)
         store = provider_names.get(store_value, store_value)
         llm = provider_names.get(llm_value, llm_value)
-        st.markdown(
-            f"""
-            <div class="connection-card">
-                <div class="status-dot online"></div>
-                <div>
-                    <div class="connection-title">Assistant disponible</div>
-                    <div class="connection-meta">{llm} · {engine} · {store}</div>
+            st.markdown(
+                f"""
+                <div class="connection-card">
+                    <div class="status-dot online"></div>
+                    <div>
+                        <div class="connection-title">Assistant disponible</div>
+                        <div class="connection-meta">{llm} · {engine} · {store}</div>
+                    </div>
                 </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                """,
+                unsafe_allow_html=True,
+            )
     else:
         st.markdown(
             """
@@ -591,6 +608,11 @@ if not api_online:
     st.warning(
         "L'assistant est momentanément indisponible. Vérifiez que l'API FastAPI est démarrée.",
         icon=":material/cloud_off:",
+    )
+elif config.get("auth_required"):
+    st.info(
+        "L'API est en ligne, mais l'authentification est requise. Configurez RAG_UI_API_KEY pour interroger l'assistant.",
+        icon=":material/key:",
     )
 
 suggested_question = None
