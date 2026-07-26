@@ -344,12 +344,13 @@ async def ingest_documents(
         raise HTTPException(400, "Ajoutez au moins un document.")
     service = get_rag_service(active_settings.workspace_id)
     try:
-        existing_ids = {
-            document.document_id
-            for document in await run_in_threadpool(service.list_documents)
-        }
-    except Exception:
-        existing_ids = set()
+        listing = await run_in_threadpool(service.list_documents)
+        existing_ids = {document.document_id for document in listing.documents}
+    except Exception as error:
+        logger.exception("Impossible de lire le registre documentaire")
+        raise HTTPException(
+            503, "Le registre documentaire est indisponible."
+        ) from error
     paths: list[Path] = []
     try:
         for upload in files:

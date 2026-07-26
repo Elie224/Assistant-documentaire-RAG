@@ -6,7 +6,7 @@ from pydantic import SecretStr
 
 from app.api import app, _cleanup_failed_uploads, _load_settings, _safe_upload_path
 from app.core.config import Settings, get_settings
-from app.core.schemas import DocumentDeletionResponse, DocumentInfo, DocumentListResponse
+from app.core.schemas import DocumentDeletionResponse, DocumentInfo, DocumentListResponse, IngestionResponse
 
 
 def _with_api_key(token: str | None) -> TestClient:
@@ -279,3 +279,49 @@ def test_failed_upload_cleanup_preserves_indexed_documents(tmp_path: Path) -> No
 
     assert not failed.exists()
     assert existing.exists()
+
+
+def test_ingest_route_cleans_previous_upload_when_next_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = get_settings().model_copy(
+        update={"api_key": None, "api_key_workspaces": {}, "raw_data_dir": tmp_path / "raw"}
+    )
+    app.dependency_overrides[_load_settings] = lambda: settings
+    saved: list[Path] = []
+    calls = 0
+
+    async def save_upload(upload, active_settings):
+        nonlocal calls
+        calls += 1
+        path = active_settings.uploads_dir / ("a" * 64) / f"file-{calls}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("pending", encoding="utf-8")
+        saved.append(path)
+        if calls == 2:
+            from fastapi import HTTPException
+            raise HTTPException(413, "trop gros")
+        return path
+
+    class Service:
+        def list_documents(self) -> DocumentListResponse:
+            return DocumentListResponse(documents=[])
+
+        def ingest(self, paths: list[Path]) -> IngestionResponse:
+            raise AssertionError("indexation ne doit pas démarrer")
+
+    monkeypatch.setattr("app.api._save_upload", save_upload)
+    monkeypatch.setattr("app.api.get_rag_service", lambda workspace_id: Service())
+    client = TestClient(app)
+    try:
+        response = client.post(
+            "/documents/ingest",
+            files=[
+                ("files", ("one.txt", b"one", "text/plain")),
+                ("files", ("two.txt", b"two", "text/plain")),
+            ],
+        )
+        assert response.status_code == 413
+        assert saved and not saved[0].exists()
+    finally:
+        _reset_overrides()
