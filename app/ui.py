@@ -3,14 +3,22 @@ import os
 import requests
 import streamlit as st
 
+from app.core.config import get_settings
 
-API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8000").rstrip("/")
+
+_SETTINGS = get_settings()
+API_URL = os.getenv(
+    "RAG_API_URL",
+    f"http://{_SETTINGS.api_host}:{_SETTINGS.api_port}",
+).rstrip("/")
 
 
 def api_headers() -> dict[str, str]:
     headers: dict[str, str] = {}
     key = os.getenv("RAG_UI_API_KEY")
-    workspace = os.getenv("RAG_WORKSPACE_ID", "default").strip()
+    if not key and _SETTINGS.api_key is not None:
+        key = _SETTINGS.api_key.get_secret_value()
+    workspace = os.getenv("RAG_WORKSPACE_ID", _SETTINGS.workspace_id).strip()
     if key:
         headers["X-API-Key"] = key
     if workspace:
