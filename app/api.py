@@ -56,7 +56,7 @@ def workspace_settings(
         raise HTTPException(400, str(error)) from error
 
 
-@lru_cache
+@lru_cache(maxsize=100)
 def get_rag_service(workspace_id: str = "default") -> RagService:
     return RagService(settings.for_workspace(workspace_id))
 
