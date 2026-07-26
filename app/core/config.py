@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Assistant RAG"
+    environment: Literal["development", "test", "production"] = "development"
+    allow_unauthenticated: bool = True
     workspace_id: str = Field(
         default="default",
         min_length=1,
@@ -75,6 +77,10 @@ class Settings(BaseSettings):
     def validate_chunking(self) -> "Settings":
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError("CHUNK_OVERLAP doit être inférieur à CHUNK_SIZE.")
+        if self.environment == "production" and self.allow_unauthenticated:
+            raise ValueError(
+                "ALLOW_UNAUTHENTICATED doit être false en production."
+            )
         return self
 
     def project_path(self, path: Path) -> Path:

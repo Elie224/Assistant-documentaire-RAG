@@ -36,6 +36,7 @@ docx2txt>=0.8
 # --- Config & utils ---
 pydantic>=2.6
 pydantic-settings>=2.2
+email-validator>=2.2
 python-dotenv>=1.0
 tiktoken>=0.6
 

@@ -100,7 +100,7 @@ def test_document_lifecycle_routes(monkeypatch: pytest.MonkeyPatch) -> None:
                 document_id=requested_id, deleted=requested_id == document_id
             )
 
-    monkeypatch.setattr("app.api.get_rag_service", lambda workspace_id: Service())
+    monkeypatch.setattr("app.api.get_rag_service", lambda active_settings: Service())
     client = _with_api_key(None)
     try:
         listing = client.get("/documents")
@@ -311,7 +311,7 @@ def test_ingest_route_cleans_previous_upload_when_next_fails(
             raise AssertionError("indexation ne doit pas démarrer")
 
     monkeypatch.setattr("app.api._save_upload", save_upload)
-    monkeypatch.setattr("app.api.get_rag_service", lambda workspace_id: Service())
+    monkeypatch.setattr("app.api.get_rag_service", lambda active_settings: Service())
     client = TestClient(app)
     try:
         response = client.post(

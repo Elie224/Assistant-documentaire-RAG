@@ -36,6 +36,8 @@ distro==1.9.0
 docstring_parser==0.18.0
 docx2txt==0.9
 durationpy==0.10
+dnspython==2.8.0
+email-validator==2.3.0
 faiss-cpu==1.14.3
 fastapi==0.140.0
 filelock==3.32.0

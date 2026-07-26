@@ -203,3 +203,58 @@ def test_langchain_document_can_be_reindexed(
     assert response.files == ["policy.txt"]
     assert RagService(settings).list_documents().documents[0].chunks == 1
     assert source.exists()
+
+
+@pytest.mark.parametrize(
+    ("engine", "store"),
+    [
+        ("langchain", "chroma"),
+        ("langchain", "faiss"),
+        ("llamaindex", "chroma"),
+        ("llamaindex", "faiss"),
+    ],
+)
+def test_local_lite_with_anthropic_configuration_matrix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    engine: str,
+    store: str,
+) -> None:
+    source = tmp_path / f"{engine}-{store}.txt"
+    source.write_text("Le contrat A se termine le 31 décembre 2026.", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_llm",
+        lambda settings: FakeListChatModel(responses=["31 décembre 2026"]),
+    )
+
+    class LlamaMock:
+        def complete(self, prompt: str):
+            del prompt
+            return SimpleNamespace(text="31 décembre 2026")
+
+    monkeypatch.setattr(
+        "app.core.providers.get_llamaindex_llm",
+        lambda settings: LlamaMock(),
+    )
+
+    settings = Settings(
+        rag_engine=engine,
+        vector_store=store,
+        llm_provider="anthropic",
+        embed_provider="local-lite",
+        local_embed_dimension=128,
+        chroma_dir=tmp_path / "chroma",
+        faiss_dir=tmp_path / "faiss",
+        chunk_size=200,
+        chunk_overlap=20,
+        score_threshold=0,
+    )
+
+    backend = LangChainBackend(settings) if engine == "langchain" else LlamaIndexBackend(settings)
+    ingestion = backend.ingest([source])
+    response = backend.ask("Quelle est la date de fin du contrat A ?", [])
+
+    assert ingestion.chunks >= 1
+    assert response.answer
+    assert response.sources

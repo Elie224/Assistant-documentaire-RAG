@@ -6,25 +6,61 @@ import secrets
 import sqlite3
 import time
 import uuid
+import re
 from pathlib import Path
 
 
 class AuthError(ValueError):
     pass
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+
+
+SCRYPT_N = 2**14
+SCRYPT_R = 8
+SCRYPT_P = 1
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> str:
     salt = salt or secrets.token_bytes(16)
-    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
-    return f"scrypt${salt.hex()}${digest.hex()}"
+    digest = hashlib.scrypt(
+        password.encode(), salt=salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P
+    )
+    return f"scrypt$n={SCRYPT_N}$r={SCRYPT_R}$p={SCRYPT_P}${salt.hex()}${digest.hex()}"
 
 
 def _verify_password(password: str, encoded: str) -> bool:
     try:
-        algorithm, salt_hex, digest_hex = encoded.split("$", 2)
+        parts = encoded.split("$")
+        if len(parts) == 3:
+            algorithm, salt_hex, digest_hex = parts
+            if algorithm != "scrypt":
+                return False
+            actual = hashlib.scrypt(
+                password.encode(),
+                salt=bytes.fromhex(salt_hex),
+                n=SCRYPT_N,
+                r=SCRYPT_R,
+                p=SCRYPT_P,
+            ).hex()
+            return hmac.compare_digest(actual, digest_hex)
+
+        if len(parts) != 6:
+            return False
+        algorithm, n_part, r_part, p_part, salt_hex, digest_hex = parts
         if algorithm != "scrypt":
             return False
-        actual = _hash_password(password, bytes.fromhex(salt_hex)).split("$", 2)[2]
+        n = int(n_part.split("=", 1)[1])
+        r = int(r_part.split("=", 1)[1])
+        p = int(p_part.split("=", 1)[1])
+        actual = hashlib.scrypt(
+            password.encode(),
+            salt=bytes.fromhex(salt_hex),
+            n=n,
+            r=r,
+            p=p,
+        ).hex()
         return hmac.compare_digest(actual, digest_hex)
     except (ValueError, TypeError):
         return False
@@ -55,7 +91,7 @@ def _connect(path: Path) -> sqlite3.Connection:
 
 def register(path: Path, email: str, password: str) -> tuple[str, str]:
     normalized = email.strip().casefold()
-    if "@" not in normalized:
+    if not _EMAIL_PATTERN.fullmatch(normalized):
         raise AuthError("Adresse email invalide.")
     user_id = uuid.uuid4().hex
     workspace_id = f"user-{user_id[:16]}"

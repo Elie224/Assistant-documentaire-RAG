@@ -5,7 +5,6 @@ import secrets
 import time
 from threading import Lock
 import uuid
-from functools import lru_cache
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
@@ -37,6 +36,8 @@ _AUTH_ATTEMPTS: dict[str, list[float]] = {}
 _AUTH_ATTEMPTS_LOCK = Lock()
 _AUTH_RATE_LIMIT = 10
 _AUTH_RATE_WINDOW = 60.0
+_SERVICE_CACHE: dict[tuple[str, str, str, str, str, str, int, int], RagService] = {}
+_SERVICE_CACHE_LOCK = Lock()
 
 
 def _check_auth_rate_limit(request: Request) -> None:
@@ -92,7 +93,9 @@ def require_api_key(
             raise HTTPException(403, "Accès interdit à ce workspace.")
         return None
     if active_settings.api_key is None or not active_settings.api_key.get_secret_value():
-        return None
+        if active_settings.allow_unauthenticated:
+            return None
+        raise HTTPException(401, "Authentification requise.")
     expected = active_settings.api_key.get_secret_value()
     if not x_api_key or not secrets.compare_digest(x_api_key, expected):
         raise HTTPException(401, "Clé API invalide ou manquante.")
@@ -111,9 +114,23 @@ def workspace_settings(
         raise HTTPException(400, str(error)) from error
 
 
-@lru_cache(maxsize=100)
-def get_rag_service(workspace_id: str = "default") -> RagService:
-    return RagService(settings.for_workspace(workspace_id))
+def get_rag_service(active_settings: Settings) -> RagService:
+    cache_key = (
+        active_settings.workspace_id,
+        active_settings.rag_engine,
+        active_settings.vector_store,
+        active_settings.embed_provider,
+        active_settings.embed_model,
+        active_settings.local_semantic_model,
+        active_settings.chunk_size,
+        active_settings.chunk_overlap,
+    )
+    with _SERVICE_CACHE_LOCK:
+        service = _SERVICE_CACHE.get(cache_key)
+        if service is None:
+            service = RagService(active_settings)
+            _SERVICE_CACHE[cache_key] = service
+        return service
 
 
 def _safe_upload_path(
@@ -279,7 +296,7 @@ async def list_documents(
     _: None = Depends(require_api_key),
     active_settings: Settings = Depends(workspace_settings),
 ) -> DocumentListResponse:
-    service = get_rag_service(active_settings.workspace_id)
+    service = get_rag_service(active_settings)
     return await run_in_threadpool(service.list_documents)
 
 
@@ -291,7 +308,7 @@ async def reindex_document(
 ) -> IngestionResponse:
     if not re.fullmatch(r"[0-9a-f]{64}", document_id):
         raise HTTPException(400, "Identifiant documentaire invalide.")
-    service = get_rag_service(active_settings.workspace_id)
+    service = get_rag_service(active_settings)
     try:
         return await run_in_threadpool(service.reindex_document, document_id)
     except ValueError as error:
@@ -310,7 +327,7 @@ async def delete_document(
 ) -> DocumentDeletionResponse:
     if not re.fullmatch(r"[0-9a-f]{64}", document_id):
         raise HTTPException(400, "Identifiant documentaire invalide.")
-    service = get_rag_service(active_settings.workspace_id)
+    service = get_rag_service(active_settings)
     try:
         response = await run_in_threadpool(service.delete_document, document_id)
     except (RagError, ValueError) as error:
@@ -342,7 +359,7 @@ async def ingest_documents(
 ) -> IngestionResponse:
     if not files:
         raise HTTPException(400, "Ajoutez au moins un document.")
-    service = get_rag_service(active_settings.workspace_id)
+    service = get_rag_service(active_settings)
     try:
         listing = await run_in_threadpool(service.list_documents)
         existing_ids = {document.document_id for document in listing.documents}
@@ -377,7 +394,7 @@ async def chat(
     active_settings: Settings = Depends(workspace_settings),
 ) -> ChatResponse:
     try:
-        service = get_rag_service(active_settings.workspace_id)
+        service = get_rag_service(active_settings)
         return await run_in_threadpool(
             service.ask,
             request.question,

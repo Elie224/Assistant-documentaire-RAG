@@ -84,6 +84,13 @@ class SearchStore:
         self.requested_k = k
         return self.results
 
+    def get(self, include=None):
+        del include
+        return {
+            "documents": [document.page_content for document, _ in self.results],
+            "metadatas": [document.metadata for document, _ in self.results],
+        }
+
 
 def test_hybrid_search_uses_a_broad_pool_for_non_local_embeddings() -> None:
     from langchain_core.documents import Document
