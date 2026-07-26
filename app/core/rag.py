@@ -668,7 +668,6 @@ class LangChainBackend:
         from app.core.providers import get_langchain_embeddings
 
         index_dir = self._ensure_dir()
-        operation_id = uuid.uuid4().hex
         with _registry_transaction(index_dir) as registry:
             kept, pairs = _split_new_paths(paths, registry)
         if not kept:
@@ -682,8 +681,10 @@ class LangChainBackend:
         chunks = _chunks_with_document_ids(kept, pairs, self.settings)
         if not chunks:
             raise ValueError("Les documents ne contiennent aucun texte exploitable.")
+        operation_ids = {digest: uuid.uuid4().hex for _, digest in pairs}
         for chunk in chunks:
-            chunk.metadata["operation_id"] = operation_id
+            document_id = str(chunk.metadata.get("document_id", ""))
+            chunk.metadata["operation_id"] = operation_ids[document_id]
 
         if self.settings.vector_store == "faiss" and not (index_dir / "index.faiss").exists():
             from langchain_community.vectorstores import FAISS
@@ -709,7 +710,7 @@ class LangChainBackend:
                     store,
                     self.settings.vector_store,
                     index_dir,
-                    {operation_id},
+                    set(operation_ids.values()),
                 )
             raise
 
@@ -720,7 +721,7 @@ class LangChainBackend:
                     store,
                     self.settings.vector_store,
                     index_dir,
-                    {operation_id},
+                    {operation_ids[digest] for digest in duplicate_ids},
                 )
             accepted_ids = inserted_ids - duplicate_ids
             if not accepted_ids:
@@ -898,7 +899,6 @@ class LlamaIndexBackend:
         from llama_index.core.schema import TextNode
 
         index_dir = self._ensure_dir()
-        operation_id = uuid.uuid4().hex
         with _registry_transaction(index_dir) as registry:
             kept, pairs = _split_new_paths(paths, registry)
         if not kept:
@@ -912,8 +912,10 @@ class LlamaIndexBackend:
         chunks = _chunks_with_document_ids(kept, pairs, self.settings)
         if not chunks:
             raise ValueError("Les documents ne contiennent aucun texte exploitable.")
+        operation_ids = {digest: uuid.uuid4().hex for _, digest in pairs}
         for chunk in chunks:
-            chunk.metadata["operation_id"] = operation_id
+            document_id = str(chunk.metadata.get("document_id", ""))
+            chunk.metadata["operation_id"] = operation_ids[document_id]
 
         index = self._index(create=True)
         nodes = [
@@ -935,9 +937,10 @@ class LlamaIndexBackend:
             with suppress(Exception):
                 with _registry_transaction(index_dir) as registry:
                     committed = {digest for digest in inserted_ids if digest in registry}
-                if not committed:
+                rollback_ids = inserted_ids - committed
+                if rollback_ids:
                     _remove_llamaindex_document_ids(
-                        index, self.settings.vector_store, index_dir, inserted_ids
+                        index, self.settings.vector_store, index_dir, rollback_ids
                     )
             raise
 
@@ -1115,8 +1118,9 @@ class RagService:
                     return self.backend.ingest(paths)
                 except Exception as error:
                     with suppress(Exception):
+                        restore_store = self.backend._store()
                         _restore_langchain_snapshot(
-                            store,
+                            restore_store,
                             self.settings.vector_store,
                             index_dir,
                             snapshot,

@@ -11,6 +11,7 @@ from app.core.config import Settings
 from app.core.rag import (
     LangChainBackend,
     LlamaIndexBackend,
+    _remove_langchain_operation_ids,
     _file_hash,
     _load_registry,
     _record_files,
@@ -234,6 +235,66 @@ def test_langchain_ingest_tags_chunks_with_operation_id(
                 metadatas.append(metadata)
         assert metadatas
         assert all("operation_id" in metadata for metadata in metadatas)
+
+
+@pytest.mark.parametrize("store", ["chroma", "faiss"])
+def test_langchain_operation_cleanup_only_removes_target_document(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: str
+) -> None:
+    first = tmp_path / "a.txt"
+    second = tmp_path / "b.txt"
+    first.write_text("Contrat A", encoding="utf-8")
+    second.write_text("Contrat B", encoding="utf-8")
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_embeddings", lambda settings: ConstantEmbeddings()
+    )
+    backend = LangChainBackend(backend_settings(tmp_path, "langchain", store))
+    backend.ingest([first, second])
+
+    first_id = _file_hash(first)
+    second_id = _file_hash(second)
+    index_dir = backend._base_dir()
+    store_obj = backend._store()
+
+    if store == "chroma":
+        first_meta = (
+            store_obj.get(where={"document_id": first_id}, include=["metadatas"])
+            .get("metadatas", [])[0]
+        )
+        first_operation = first_meta["operation_id"]
+        _remove_langchain_operation_ids(store_obj, store, index_dir, {first_operation})
+
+        first_ids = store_obj.get(where={"document_id": first_id}, include=[]).get("ids", [])
+        second_ids = store_obj.get(where={"document_id": second_id}, include=[]).get("ids", [])
+        assert not first_ids
+        assert second_ids
+    else:
+        first_operation = None
+        first_chunks = 0
+        second_chunks = 0
+        for item_id in store_obj.index_to_docstore_id.values():
+            document = store_obj.docstore.search(item_id)
+            metadata = getattr(document, "metadata", {})
+            if metadata.get("document_id") == first_id:
+                first_operation = metadata.get("operation_id")
+                first_chunks += 1
+            if metadata.get("document_id") == second_id:
+                second_chunks += 1
+        assert first_operation is not None
+        _remove_langchain_operation_ids(store_obj, store, index_dir, {first_operation})
+
+        first_chunks_after = 0
+        second_chunks_after = 0
+        reloaded = backend._store()
+        for item_id in reloaded.index_to_docstore_id.values():
+            document = reloaded.docstore.search(item_id)
+            metadata = getattr(document, "metadata", {})
+            if metadata.get("document_id") == first_id:
+                first_chunks_after += 1
+            if metadata.get("document_id") == second_id:
+                second_chunks_after += 1
+        assert first_chunks > 0 and first_chunks_after == 0
+        assert second_chunks > 0 and second_chunks_after > 0
 
 
 def test_langchain_reindex_restores_previous_version_on_ingest_failure(
