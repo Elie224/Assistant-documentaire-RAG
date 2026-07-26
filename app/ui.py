@@ -13,9 +13,9 @@ def api_headers() -> dict[str, str]:
 
 
 SUGGESTIONS = [
-    ("💶", "Quel est le montant de l'allocation annuelle ?"),
-    ("🕘", "Quels sont les horaires du support informatique ?"),
-    ("🏠", "Quelles sont les règles concernant le télétravail ?"),
+    (":material/payments:", "Quel est le montant de l'allocation annuelle ?"),
+    (":material/schedule:", "Quels sont les horaires du support informatique ?"),
+    (":material/home_work:", "Quelles sont les règles concernant le télétravail ?"),
 ]
 
 
@@ -325,6 +325,33 @@ st.markdown(
         padding: .75rem .2rem 0;
     }
 
+    .stApp {
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .stButton > button:focus-visible,
+    [data-testid="stChatInput"]:focus-within,
+    [data-testid="stFileUploaderDropzone"]:focus-within {
+        outline: 3px solid rgba(91, 92, 226, .28);
+        outline-offset: 2px;
+    }
+
+    .stButton > button:disabled {
+        opacity: .56;
+        transform: none;
+        box-shadow: none;
+    }
+
+    [data-testid="stChatMessageContent"] {
+        color: var(--ink);
+        line-height: 1.7;
+    }
+
+    [data-testid="stAlert"] {
+        border-radius: .9rem;
+        border: 1px solid rgba(91, 92, 226, .16);
+    }
+
     @media (max-width: 760px) {
         .main .block-container { padding: 1rem 1rem 6rem; }
         .hero { padding: 1.5rem; border-radius: 1.2rem; }
@@ -338,17 +365,22 @@ st.markdown(
 
 
 def api_error(response: requests.Response) -> str:
+    if response.status_code == 401:
+        return "Accès refusé par l'API. Vérifiez la clé RAG_UI_API_KEY."
+    if response.status_code >= 500:
+        return "Le service documentaire rencontre un problème. Réessayez dans quelques instants."
     try:
-        return str(response.json().get("detail", response.text))
+        return str(response.json().get("detail", "La requête n'a pas pu aboutir."))
     except requests.JSONDecodeError:
-        return response.text or "Erreur inconnue"
+        return "La requête n'a pas pu aboutir."
 
 
 @st.cache_data(ttl=5, show_spinner=False)
 def get_api_health() -> tuple[bool, dict]:
     try:
-        response = requests.get(f"{API_URL}/health", timeout=3)
-        response = requests.get(f"{API_URL}/health", timeout=3, headers=api_headers())
+        response = requests.get(
+            f"{API_URL}/health", timeout=3, headers=api_headers()
+        )
         response.raise_for_status()
         return True, response.json()
     except requests.RequestException:
@@ -358,23 +390,27 @@ def get_api_health() -> tuple[bool, dict]:
 def render_sources(sources: list[dict]) -> None:
     if not sources:
         return
+
     label = f"{len(sources)} source{'s' if len(sources) > 1 else ''} consultée{'s' if len(sources) > 1 else ''}"
-    with st.expander(f"📎 {label}"):
+    with st.expander(label, icon=":material/menu_book:"):
         for position, source in enumerate(sources, start=1):
-            page = f" · page {source['page']}" if source.get("page") else ""
-            score = (
-                f" · pertinence {source['score']:.0%}"
-                if source.get("score") is not None
-                else ""
-            )
+            source_name = source.get("source", "Document inconnu")
+            metadata = []
+            if source.get("page"):
+                metadata.append(f"Page {source['page']}")
+            if source.get("score") is not None:
+                metadata.append(f"Pertinence {source['score']:.0%}")
+            preview = source.get("preview") or source.get("content") or "Extrait indisponible."
             with st.container(border=True):
-                st.markdown(f"**[{position}] {source['source']}**{page}{score}")
-                st.caption(source["preview"])
+                st.markdown(f"**{position:02d} · {source_name}**")
+                if metadata:
+                    st.caption(" · ".join(metadata))
+                st.write(preview)
 
 
 def display_message(message: dict) -> None:
-    avatar = "🙂" if message["role"] == "user" else "🤖"
-    with st.chat_message(message["role"], avatar=avatar):
+    avatar = ":material/person:" if message["role"] == "user" else ":material/smart_toy:"
+    with st.chat_message(message["role"], avatar=avatar, width="stretch"):
         st.markdown(message["content"])
         render_sources(message.get("sources", []))
 
@@ -393,6 +429,8 @@ provider_names = {
     "openai": "OpenAI",
     "ollama": "Ollama",
     "local": "Local",
+    "local-lite": "Local léger",
+    "semantic": "Sémantique",
     "langchain": "LangChain",
     "llamaindex": "LlamaIndex",
     "chroma": "ChromaDB",
@@ -414,9 +452,12 @@ with st.sidebar:
     )
 
     if api_online:
-        engine = provider_names.get(config["engine"], config["engine"])
-        store = provider_names.get(config["vector_store"], config["vector_store"])
-        llm = provider_names.get(config["llm_provider"], config["llm_provider"])
+        engine_value = config.get("engine", "langchain")
+        store_value = config.get("vector_store", "chroma")
+        llm_value = config.get("llm_provider", "anthropic")
+        engine = provider_names.get(engine_value, engine_value)
+        store = provider_names.get(store_value, store_value)
+        llm = provider_names.get(llm_value, llm_value)
         st.markdown(
             f"""
             <div class="connection-card">
@@ -443,12 +484,14 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-    st.markdown("#### Ajouter des documents")
-    st.caption("PDF, Word, Markdown ou texte · 20 Mo maximum")
+    st.markdown("#### Bibliothèque documentaire")
+    st.caption("Importez vos sources pour interroger votre base documentaire")
     uploads = st.file_uploader(
-        "Déposez vos fichiers ici",
+        "Sélectionner des documents",
         type=["pdf", "docx", "txt", "md"],
         accept_multiple_files=True,
+        max_upload_size=20,
+        width="stretch",
         label_visibility="collapsed",
     )
 
@@ -457,10 +500,11 @@ with st.sidebar:
         st.caption(f"{len(uploads)} fichier(s) sélectionné(s) · {total_size:.1f} Mo")
 
     if st.button(
-        "✦ Indexer les documents",
+        "Indexer les documents",
+        icon=":material/upload_file:",
         type="primary",
         disabled=not uploads or not api_online,
-        use_container_width=True,
+        width="stretch",
     ):
         payload = [
             ("files", (upload.name, upload.getvalue(), upload.type)) for upload in uploads
@@ -476,31 +520,38 @@ with st.sidebar:
                 )
                 if response.ok:
                     result = response.json()
-                    st.session_state.indexed_files += len(result["files"])
+                    indexed_count = len(result["files"])
+                    st.session_state.indexed_files += indexed_count
                     st.session_state.indexed_chunks += result["chunks"]
+                    if indexed_count:
+                        status_label = f"{indexed_count} document(s) prêt(s) à interroger"
+                        st.toast("Base documentaire mise à jour", icon="✅")
+                    else:
+                        status_label = "Aucun nouveau document"
+                        st.info("Ces documents sont déjà présents dans votre base.")
                     status.update(
-                        label=f"{len(result['files'])} document(s) prêt(s) à interroger",
+                        label=status_label,
                         state="complete",
                         expanded=False,
                     )
-                    st.toast("Base documentaire mise à jour", icon="✅")
                 else:
                     status.update(label="Indexation interrompue", state="error")
                     st.error(api_error(response))
-            except requests.RequestException as error:
+            except requests.RequestException:
                 status.update(label="API inaccessible", state="error")
-                st.error(f"Impossible de contacter l'API : {error}")
+                st.error("Impossible de contacter l'API. Vérifiez que le serveur FastAPI est démarré.")
 
     if st.session_state.indexed_files:
         metric_files, metric_chunks = st.columns(2)
-        metric_files.metric("Documents", st.session_state.indexed_files)
-        metric_chunks.metric("Extraits", st.session_state.indexed_chunks)
+        metric_files.metric("Documents indexés", st.session_state.indexed_files)
+        metric_chunks.metric("Extraits disponibles", st.session_state.indexed_chunks)
 
-    st.divider()
+    st.space("small")
     if st.button(
-        "↻ Nouvelle conversation",
+        "Nouvelle conversation",
+        icon=":material/add_comment:",
         disabled=not st.session_state.messages,
-        use_container_width=True,
+        width="stretch",
     ):
         st.session_state.messages = []
         st.rerun()
@@ -517,7 +568,7 @@ with st.sidebar:
 st.markdown(
     """
     <section class="hero">
-        <div class="eyebrow">✦ VOTRE ESPACE DOCUMENTAIRE</div>
+        <div class="eyebrow">Votre espace documentaire</div>
         <h1>Vos documents ont beaucoup à vous dire.</h1>
         <p>
             Ajoutez vos fichiers, posez une question naturellement et obtenez une réponse claire,
@@ -528,23 +579,29 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if not api_online:
+    st.warning(
+        "L'assistant est momentanément indisponible. Vérifiez que l'API FastAPI est démarrée.",
+        icon=":material/cloud_off:",
+    )
+
 suggested_question = None
 if not st.session_state.messages:
     st.markdown(
         """
         <div class="steps">
             <div class="step">
-                <div class="step-number">ÉTAPE 01</div>
+                <div class="step-number">01 · Importer</div>
                 <div class="step-title">Ajoutez vos fichiers</div>
                 <div class="step-copy">Utilisez le panneau à gauche pour créer votre base.</div>
             </div>
             <div class="step">
-                <div class="step-number">ÉTAPE 02</div>
+                <div class="step-number">02 · Interroger</div>
                 <div class="step-title">Posez une question</div>
                 <div class="step-copy">Écrivez comme vous parleriez à un collègue.</div>
             </div>
             <div class="step">
-                <div class="step-number">ÉTAPE 03</div>
+                <div class="step-number">03 · Vérifier</div>
                 <div class="step-title">Vérifiez les sources</div>
                 <div class="step-copy">Chaque réponse indique les extraits consultés.</div>
             </div>
@@ -557,9 +614,10 @@ if not st.session_state.messages:
     for column, (icon, prompt) in zip(suggestion_columns, SUGGESTIONS, strict=True):
         with column:
             if st.button(
-                f"{icon}  {prompt}",
+                prompt,
+                icon=icon,
                 key=f"suggestion-{prompt}",
-                use_container_width=True,
+                width="stretch",
                 disabled=not api_online,
             ):
                 suggested_question = prompt
@@ -569,6 +627,7 @@ else:
 
 typed_question = st.chat_input(
     "Posez une question sur vos documents…",
+    max_chars=4000,
     disabled=not api_online,
 )
 question = typed_question or suggested_question
@@ -582,7 +641,7 @@ if question:
     st.session_state.messages.append(user_message)
     display_message(user_message)
 
-    with st.chat_message("assistant", avatar="🤖"):
+    with st.chat_message("assistant", avatar=":material/smart_toy:", width="stretch"):
         with st.spinner("Je cherche les passages les plus utiles…"):
             try:
                 response = requests.post(
@@ -604,5 +663,5 @@ if question:
                     st.rerun()
                 else:
                     st.error(f"Je n'ai pas pu répondre : {api_error(response)}")
-            except requests.RequestException as error:
-                st.error(f"La connexion avec l'assistant a été interrompue : {error}")
+            except requests.RequestException:
+                st.error("La connexion avec l'assistant a été interrompue. Réessayez dans quelques instants.")

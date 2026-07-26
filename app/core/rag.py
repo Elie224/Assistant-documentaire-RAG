@@ -34,6 +34,8 @@ Question : {question}
 class RagBackend(Protocol):
     def ingest(self, paths: list[Path]) -> IngestionResponse: ...
 
+    def retrieve(self, question: str) -> list[tuple]: ...
+
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse: ...
 
 
@@ -228,6 +230,9 @@ class LangChainBackend:
             self.settings.bm25_weight,
         )
 
+    def retrieve(self, question: str) -> list[tuple]:
+        return self._search(question, self._store())
+
     def _store(self):
         from app.core.providers import get_langchain_embeddings
 
@@ -295,8 +300,7 @@ class LangChainBackend:
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse:
         from app.core.providers import get_langchain_llm
 
-        store = self._store()
-        scored = self._search(question, store)
+        scored = self.retrieve(question)
         filtered_scored = _filter_scored_results(
             scored,
             self.settings.score_threshold,
@@ -431,15 +435,14 @@ class LlamaIndexBackend:
             vector_store=self.settings.vector_store,
         )
 
+    def retrieve(self, question: str) -> list[tuple]:
+        index = self._index()
+        retriever = index.as_retriever(similarity_top_k=self.settings.top_k)
+        return retriever.retrieve(question)
+
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse:
         from app.core.providers import get_llamaindex_llm
 
-        index = self._index()
-        query_engine = index.as_query_engine(
-            llm=get_llamaindex_llm(self.settings),
-            similarity_top_k=self.settings.top_k,
-            response_mode="compact",
-        )
         enriched_question = (
             "Réponds en français, naturellement, uniquement à partir des documents. "
             "Si l'information manque, indique-le. Les sources sont affichées séparément : "
@@ -447,10 +450,9 @@ class LlamaIndexBackend:
             f"Historique récent:\n{_history_text(history)}\n"
             f"Question: {question}"
         )
-        response = query_engine.query(enriched_question)
         selected_nodes = [
             source_node
-            for source_node in response.source_nodes
+            for source_node in self.retrieve(enriched_question)
             if _score_is_allowed(
                 source_node.score,
                 self.settings.score_threshold,
@@ -476,15 +478,16 @@ class LlamaIndexBackend:
                     content=text,
                 )
             )
-        enriched = (
-            "Contexte documentaire à utiliser :\n"
-            + "\n\n".join(context_segments)
-            + "\n\n"
-            + enriched_question
+
+        prompt = SYSTEM_PROMPT.format(
+            context="\n\n".join(context_segments),
+            history=_history_text(history),
+            question=question,
         )
-        rerun = query_engine.query(enriched)
+        completion = get_llamaindex_llm(self.settings).complete(prompt)
+        answer = getattr(completion, "text", str(completion))
         return ChatResponse(
-            answer=_humanize_answer(str(rerun)),
+            answer=_humanize_answer(answer),
             sources=sources,
             engine=self.settings.rag_engine,
             vector_store=self.settings.vector_store,
@@ -511,14 +514,21 @@ class RagService:
             return self.backend.ask(question, history)
 
 
+_BM25_TOKEN_PATTERN = re.compile(r"\b[\wÀ-ÿ'-]+\b", re.UNICODE)
+
+
+def _tokenize(text: str) -> list[str]:
+    return _BM25_TOKEN_PATTERN.findall(text.casefold())
+
+
 def _bm25_search(
     question: str, documents: list, top_k: int
 ) -> list[tuple]:
     from rank_bm25 import BM25Okapi
 
-    tokenized = [doc.page_content.lower().split() for doc in documents]
+    tokenized = [_tokenize(doc.page_content) for doc in documents]
     bm25 = BM25Okapi(tokenized)
-    tokens = question.lower().split()
+    tokens = _tokenize(question)
     scores = bm25.get_scores(tokens)
     indexed = sorted(
         enumerate(scores), key=lambda item: item[1], reverse=True

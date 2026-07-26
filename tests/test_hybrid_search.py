@@ -5,7 +5,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
 from app.core.config import Settings
-from app.core.rag import LangChainBackend, _bm25_search
+from app.core.rag import LangChainBackend, _bm25_search, _tokenize
 
 
 class ConstantEmbeddings(Embeddings):
@@ -148,3 +148,13 @@ def test_filtered_sources_stay_aligned_with_context(
     assert "Passage conservé A" in recording_llm.prompts[0]
     assert "Passage conservé C" in recording_llm.prompts[0]
     assert "Passage supprimé" not in recording_llm.prompts[0]
+
+
+def test_bm25_tokenizer_handles_french_punctuation() -> None:
+    assert _tokenize("Le support, technique est ouvert ?") == [
+        "le",
+        "support",
+        "technique",
+        "est",
+        "ouvert",
+    ]

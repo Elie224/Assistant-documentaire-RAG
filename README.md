@@ -159,7 +159,13 @@ Le dépôt contient un petit jeu de questions dans `evals/rag_dataset.json` pour
 python scripts/evaluate_retrieval.py
 ```
 
-Le script affiche `Recall@K` et `MRR` pour vérifier que les sources attendues apparaissent dans les passages récupérés.
+Le script affiche `Recall@K` et `MRR` pour vérifier que les sources attendues apparaissent dans les passages récupérés. Il n'appelle aucun LLM.
+
+Pour évaluer aussi la génération (le fournisseur configuré sera appelé), lancez après l'indexation :
+
+```powershell
+python scripts/evaluate_generation.py
+```
 ## Déploiement Docker
 
 ```bash

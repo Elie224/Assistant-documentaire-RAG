@@ -12,12 +12,11 @@ def evaluate(dataset_path: Path) -> dict[str, float | int]:
     dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
     settings = Settings()
     backend = LangChainBackend(settings)
-    store = backend._store()
     hits = 0
     reciprocal_rank = 0.0
 
     for item in dataset:
-        results = backend._search(item["question"], store)
+        results = backend.retrieve(item["question"])
         sources = [
             str(document.metadata.get("source", ""))
             for document, _ in results

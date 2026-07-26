@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.embeddings import Embeddings
@@ -96,3 +97,45 @@ def test_duplicate_files_are_skipped(tmp_path: Path) -> None:
     again, _ = _split_new_paths([source], _load_registry(tmp_path))
     assert not again
     assert _file_hash(source)
+
+
+def test_llamaindex_generation_uses_filtered_nodes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Node:
+        metadata = {"source": "policy.md"}
+
+        def get_content(self) -> str:
+            return "Le télétravail est possible trois jours par semaine."
+
+    class Retriever:
+        def retrieve(self, question: str):
+            return [SimpleNamespace(node=Node(), score=0.9)]
+
+    class Index:
+        def as_retriever(self, similarity_top_k: int):
+            return Retriever()
+
+    class RecordingLLM:
+        calls = 0
+        prompt = ""
+
+        def complete(self, prompt: str):
+            self.calls += 1
+            self.prompt = prompt
+            return SimpleNamespace(text="Trois jours par semaine.")
+
+    llm = RecordingLLM()
+    monkeypatch.setattr(
+        "app.core.providers.get_llamaindex_llm", lambda settings: llm
+    )
+    settings = backend_settings(tmp_path, "llamaindex", "chroma")
+    backend = LlamaIndexBackend(settings)
+    backend._index = lambda create=False: Index()
+
+    response = backend.ask("Combien de jours ?", [])
+
+    assert llm.calls == 1
+    assert response.sources[0].source == "policy.md"
+    assert "Trois jours" in response.answer
+    assert "télétravail" in llm.prompt
