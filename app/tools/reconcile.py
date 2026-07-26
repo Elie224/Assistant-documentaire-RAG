@@ -30,6 +30,53 @@ def _vector_document_ids(backend: LangChainBackend) -> set[str]:
     return document_ids
 
 
+def _vector_details(
+    backend: LangChainBackend,
+) -> tuple[set[str], dict[str, int], set[str], dict[str, set[str]]]:
+    store = backend._store()
+    document_ids: set[str] = set()
+    chunks_by_document: dict[str, int] = {}
+    operation_ids: set[str] = set()
+    operation_documents: dict[str, set[str]] = {}
+
+    if backend.settings.vector_store == "chroma":
+        payload = store.get(include=["metadatas"])
+        metadatas = payload.get("metadatas", []) or []
+        for metadata in metadatas:
+            if not metadata:
+                continue
+            document_id = metadata.get("document_id")
+            if document_id:
+                key = str(document_id)
+                document_ids.add(key)
+                chunks_by_document[key] = chunks_by_document.get(key, 0) + 1
+            operation_id = metadata.get("operation_id")
+            if operation_id:
+                key = str(operation_id)
+                operation_ids.add(key)
+                operation_documents.setdefault(key, set())
+                if document_id:
+                    operation_documents[key].add(str(document_id))
+        return document_ids, chunks_by_document, operation_ids, operation_documents
+
+    for item_id in store.index_to_docstore_id.values():
+        document = store.docstore.search(item_id)
+        metadata = getattr(document, "metadata", {})
+        document_id = metadata.get("document_id")
+        if document_id:
+            key = str(document_id)
+            document_ids.add(key)
+            chunks_by_document[key] = chunks_by_document.get(key, 0) + 1
+        operation_id = metadata.get("operation_id")
+        if operation_id:
+            key = str(operation_id)
+            operation_ids.add(key)
+            operation_documents.setdefault(key, set())
+            if document_id:
+                operation_documents[key].add(str(document_id))
+    return document_ids, chunks_by_document, operation_ids, operation_documents
+
+
 def reconcile(settings: Settings) -> dict:
     index_dir = settings.isolated_index_dir
     registry = _load_registry(index_dir)
@@ -43,9 +90,14 @@ def reconcile(settings: Settings) -> dict:
     } if uploads.exists() else set()
 
     vector_ids: set[str]
+    vector_chunk_counts: dict[str, int] = {}
+    operation_ids: set[str] = set()
+    operation_documents: dict[str, set[str]] = {}
     try:
         if settings.rag_engine == "langchain":
-            vector_ids = _vector_document_ids(LangChainBackend(settings))
+            vector_ids, vector_chunk_counts, operation_ids, operation_documents = _vector_details(
+                LangChainBackend(settings)
+            )
         else:
             # LlamaIndex snapshots are harder to introspect consistently across stores;
             # use registry as source of truth until engine-specific probes are added.
@@ -58,6 +110,20 @@ def reconcile(settings: Settings) -> dict:
     vectors_without_registry = sorted(vector_ids - registry_ids)
     files_without_registry = sorted(file_ids - registry_ids)
     registry_without_files = sorted(registry_ids - file_ids)
+    registry_chunk_counts = getattr(registry, "chunk_counts", {})
+    chunk_count_mismatch = sorted(
+        document_id
+        for document_id in (registry_ids & vector_ids)
+        if int(registry_chunk_counts.get(document_id, 0)) != int(vector_chunk_counts.get(document_id, 0))
+    )
+
+    orphan_operation_ids: list[str] = []
+    if settings.rag_engine == "langchain":
+        orphan_operation_ids = sorted(
+            op_id
+            for op_id, documents in operation_documents.items()
+            if documents and not (documents & registry_ids)
+        )
 
     return {
         "workspace_id": settings.workspace_id,
@@ -67,12 +133,15 @@ def reconcile(settings: Settings) -> dict:
             "registry": len(registry_ids),
             "vectors": len(vector_ids),
             "files": len(file_ids),
+            "operation_ids": len(operation_ids),
         },
         "issues": {
             "registry_without_vectors": registry_without_vectors,
             "vectors_without_registry": vectors_without_registry,
             "files_without_registry": files_without_registry,
             "registry_without_files": registry_without_files,
+            "chunk_count_mismatch": chunk_count_mismatch,
+            "orphan_operation_ids": orphan_operation_ids,
         },
     }
 

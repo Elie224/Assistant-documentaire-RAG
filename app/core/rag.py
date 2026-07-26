@@ -792,35 +792,47 @@ class LangChainBackend:
 
         with _registry_transaction(index_dir) as registry:
             duplicate_ids = {digest for _, digest in pairs if digest in registry}
+            duplicate_operation_ids = {operation_ids[digest] for digest in duplicate_ids}
             if duplicate_ids:
-                _remove_langchain_operation_ids(
-                    store,
-                    self.settings.vector_store,
-                    index_dir,
-                    {operation_ids[digest] for digest in duplicate_ids},
+                logger.warning(
+                    "Conflit d'ingestion LangChain détecté pour %s.",
+                    sorted(duplicate_ids),
                 )
             accepted_ids = inserted_ids - duplicate_ids
             if not accepted_ids:
+                accepted_pairs = []
+                accepted_chunks = []
+            else:
+                accepted_pairs = [pair for pair in pairs if pair[1] in accepted_ids]
+                accepted_chunks = [
+                    chunk
+                    for chunk in chunks
+                    if chunk.metadata.get("document_id") in accepted_ids
+                ]
+                _record_registry_entries(registry, accepted_pairs, accepted_chunks)
+                _index_chunks_for_fts(index_dir, accepted_chunks)
+
+        if duplicate_operation_ids:
+            _remove_langchain_operation_ids(
+                store,
+                self.settings.vector_store,
+                index_dir,
+                duplicate_operation_ids,
+            )
+
+        if not accepted_ids:
                 return IngestionResponse(
                     files=[],
                     chunks=0,
                     engine=self.settings.rag_engine,
                     vector_store=self.settings.vector_store,
                 )
-            accepted_pairs = [pair for pair in pairs if pair[1] in accepted_ids]
-            accepted_chunks = [
-                chunk
-                for chunk in chunks
-                if chunk.metadata.get("document_id") in accepted_ids
-            ]
-            _record_registry_entries(registry, accepted_pairs, accepted_chunks)
-            _index_chunks_for_fts(index_dir, accepted_chunks)
-            return IngestionResponse(
-                files=[path.name for path, _ in accepted_pairs],
-                chunks=len(accepted_chunks),
-                engine=self.settings.rag_engine,
-                vector_store=self.settings.vector_store,
-            )
+        return IngestionResponse(
+            files=[path.name for path, _ in accepted_pairs],
+            chunks=len(accepted_chunks),
+            engine=self.settings.rag_engine,
+            vector_store=self.settings.vector_store,
+        )
 
     def list_documents(self) -> DocumentListResponse:
         return _registry_documents(self._base_dir())
