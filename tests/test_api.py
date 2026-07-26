@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from pydantic import SecretStr
 
-from app.api import app, _load_settings, _safe_upload_path
+from app.api import app, _cleanup_failed_uploads, _load_settings, _safe_upload_path
 from app.core.config import Settings, get_settings
 from app.core.schemas import DocumentDeletionResponse, DocumentInfo, DocumentListResponse
 
@@ -251,3 +251,31 @@ def test_change_password_revokes_existing_sessions(tmp_path: Path) -> None:
     finally:
         _reset_overrides()
         api_module._AUTH_ATTEMPTS.clear()
+
+
+def test_legacy_api_key_cannot_select_custom_workspace() -> None:
+    client = _with_api_key("shared-secret")
+    try:
+        assert client.get(
+            "/health",
+            headers={"X-API-Key": "shared-secret", "X-Workspace-ID": "team-a"},
+        ).status_code == 403
+        assert client.get(
+            "/health", headers={"X-API-Key": "shared-secret"}
+        ).status_code == 200
+    finally:
+        _reset_overrides()
+
+
+def test_failed_upload_cleanup_preserves_indexed_documents(tmp_path: Path) -> None:
+    failed = tmp_path / ("a" * 64) / "new.txt"
+    failed.parent.mkdir()
+    failed.write_text("orphan", encoding="utf-8")
+    existing = tmp_path / ("b" * 64) / "old.txt"
+    existing.parent.mkdir()
+    existing.write_text("indexed", encoding="utf-8")
+
+    _cleanup_failed_uploads([failed, existing], {"b" * 64})
+
+    assert not failed.exists()
+    assert existing.exists()

@@ -96,6 +96,8 @@ def require_api_key(
     expected = active_settings.api_key.get_secret_value()
     if not x_api_key or not secrets.compare_digest(x_api_key, expected):
         raise HTTPException(401, "Clé API invalide ou manquante.")
+    if workspace_id != "default":
+        raise HTTPException(403, "La clé API historique est limitée au workspace default.")
     return None
 
 
@@ -318,6 +320,20 @@ async def delete_document(
     return response
 
 
+
+
+def _cleanup_failed_uploads(paths: list[Path], existing_ids: set[str]) -> None:
+    for path in paths:
+        document_id = path.parent.name
+        if document_id in existing_ids:
+            continue
+        try:
+            path.unlink(missing_ok=True)
+            if path.parent.is_dir() and not any(path.parent.iterdir()):
+                path.parent.rmdir()
+        except OSError:
+            logger.warning("Impossible de nettoyer l'upload échoué: %s", path)
+
 @app.post("/documents/ingest", response_model=IngestionResponse)
 async def ingest_documents(
     _: None = Depends(require_api_key),
@@ -326,13 +342,27 @@ async def ingest_documents(
 ) -> IngestionResponse:
     if not files:
         raise HTTPException(400, "Ajoutez au moins un document.")
-    paths = [await _save_upload(upload, active_settings) for upload in files]
+    service = get_rag_service(active_settings.workspace_id)
     try:
-        service = get_rag_service(active_settings.workspace_id)
+        existing_ids = {
+            document.document_id
+            for document in await run_in_threadpool(service.list_documents)
+        }
+    except Exception:
+        existing_ids = set()
+    paths: list[Path] = []
+    try:
+        for upload in files:
+            paths.append(await _save_upload(upload, active_settings))
         return await run_in_threadpool(service.ingest, paths)
+    except HTTPException:
+        _cleanup_failed_uploads(paths, existing_ids)
+        raise
     except (RagError, ValueError) as error:
+        _cleanup_failed_uploads(paths, existing_ids)
         raise HTTPException(400, str(error)) from error
     except Exception as error:
+        _cleanup_failed_uploads(paths, existing_ids)
         logger.exception("Échec de l'indexation des documents")
         raise HTTPException(
             503, "Échec de l'indexation. Consultez les logs du serveur."
