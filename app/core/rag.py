@@ -470,7 +470,7 @@ def _fts_search(index_dir: Path, question: str, top_k: int) -> list[tuple]:
     tokens = _tokenize(question)
     if not tokens:
         return []
-    query = " OR ".join(f'"{token.replace("\"", "")}"' for token in tokens[:20])
+    query = " OR ".join(f'"{token.replace(chr(34), "")}"' for token in tokens[:20])
     try:
         with _connect_registry(index_dir) as connection:
             rows = connection.execute(
