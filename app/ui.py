@@ -477,12 +477,12 @@ with st.sidebar:
                 unsafe_allow_html=True,
             )
         else:
-        engine_value = config.get("engine", "langchain")
-        store_value = config.get("vector_store", "chroma")
-        llm_value = config.get("llm_provider", "anthropic")
-        engine = provider_names.get(engine_value, engine_value)
-        store = provider_names.get(store_value, store_value)
-        llm = provider_names.get(llm_value, llm_value)
+            engine_value = config.get("engine", "langchain")
+            store_value = config.get("vector_store", "chroma")
+            llm_value = config.get("llm_provider", "anthropic")
+            engine = provider_names.get(engine_value, engine_value)
+            store = provider_names.get(store_value, store_value)
+            llm = provider_names.get(llm_value, llm_value)
             st.markdown(
                 f"""
                 <div class="connection-card">
