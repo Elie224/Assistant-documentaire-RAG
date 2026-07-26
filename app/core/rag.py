@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import os
 import sqlite3
@@ -25,6 +26,9 @@ from app.core.schemas import (
     IngestionResponse,
     SourceChunk,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 NO_ANSWER_MESSAGE = "Je ne trouve pas cette information dans les documents indexés."
@@ -894,6 +898,7 @@ class LlamaIndexBackend:
         from llama_index.core.schema import TextNode
 
         index_dir = self._ensure_dir()
+        operation_id = uuid.uuid4().hex
         with _registry_transaction(index_dir) as registry:
             kept, pairs = _split_new_paths(paths, registry)
         if not kept:
@@ -907,6 +912,8 @@ class LlamaIndexBackend:
         chunks = _chunks_with_document_ids(kept, pairs, self.settings)
         if not chunks:
             raise ValueError("Les documents ne contiennent aucun texte exploitable.")
+        for chunk in chunks:
+            chunk.metadata["operation_id"] = operation_id
 
         index = self._index(create=True)
         nodes = [
@@ -923,17 +930,23 @@ class LlamaIndexBackend:
             if self.settings.vector_store == "faiss":
                 index.storage_context.persist(persist_dir=str(self._base_dir()))
         except Exception:
+            # Best-effort rollback only when no concurrent winner is visible in registry.
+            # Deleting by document_id after a concurrent commit can remove valid chunks.
             with suppress(Exception):
-                _remove_llamaindex_document_ids(
-                    index, self.settings.vector_store, index_dir, inserted_ids
-                )
+                with _registry_transaction(index_dir) as registry:
+                    committed = {digest for digest in inserted_ids if digest in registry}
+                if not committed:
+                    _remove_llamaindex_document_ids(
+                        index, self.settings.vector_store, index_dir, inserted_ids
+                    )
             raise
 
         with _registry_transaction(index_dir) as registry:
             duplicate_ids = {digest for _, digest in pairs if digest in registry}
             if duplicate_ids:
-                _remove_llamaindex_document_ids(
-                    index, self.settings.vector_store, index_dir, duplicate_ids
+                logger.warning(
+                    "Conflit d'ingestion LlamaIndex détecté pour %s: nettoyage vectoriel ignoré pour éviter une suppression destructive.",
+                    sorted(duplicate_ids),
                 )
             accepted_ids = inserted_ids - duplicate_ids
             if not accepted_ids:
