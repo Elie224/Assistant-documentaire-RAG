@@ -11,7 +11,6 @@ Un projet complet de **Retrieval-Augmented Generation** capable d'indexer des do
 - import de fichiers PDF, DOCX, TXT et Markdown ;
 - découpage configurable avec chevauchement ;
 - génération avec Claude/Anthropic, OpenAI ou modèles locaux Ollama ;
-- génération avec Claude/Anthropic, OpenAI ou modèles locaux Ollama ;
 - embeddings OpenAI, Ollama, sentence-transformers (`semantic`) ou hashing lexical local (`local-lite`) ;
 - orchestration interchangeable entre LangChain et LlamaIndex ;
 - stockage vectoriel persistant avec ChromaDB ou FAISS ;
@@ -120,7 +119,7 @@ Pour un premier essai, importez `examples/demo.md`, puis demandez : **« Quel es
 |---|---:|---|
 | `RAG_ENGINE` | `langchain` | `langchain` ou `llamaindex` |
 | `LLM_PROVIDER` | `anthropic` | `anthropic`, `openai` ou `ollama` |
-| `EMBED_PROVIDER` | `local` | `local`, `openai` ou `ollama` |
+| `EMBED_PROVIDER` | `local-lite` | `semantic`, `local-lite`, `openai` ou `ollama` |
 | `VECTOR_STORE` | `chroma` | `chroma` ou `faiss` |
 | `CHUNK_SIZE` | `800` | Taille maximale d'un extrait |
 | `CHUNK_OVERLAP` | `120` | Chevauchement entre extraits |
@@ -152,6 +151,15 @@ pytest -q
 
 Les tests unitaires n'appellent ni OpenAI ni Claude. La validation réelle de l'ingestion et du chat nécessite le fournisseur configuré dans `.env`. Une CI GitHub Actions exécute la suite à chaque push.
 
+## Évaluation du retrieval
+
+Le dépôt contient un petit jeu de questions dans `evals/rag_dataset.json` pour mesurer le retrieval sans appeler de LLM. Après avoir indexé `examples/demo.md`, lancez :
+
+```powershell
+python scripts/evaluate_retrieval.py
+```
+
+Le script affiche `Recall@K` et `MRR` pour vérifier que les sources attendues apparaissent dans les passages récupérés.
 ## Déploiement Docker
 
 ```bash
@@ -167,8 +175,8 @@ uv pip freeze --python .venv/Scripts/python.exe > requirements.lock
 # ou
 pip freeze > requirements.lock
 ```
-- LLM : `anthropic` · Embeddings : `embed_provider`
-| LLM : `llm_provider` · Embeddings : `embed_provider` |
+
+
 ## Sécurité
 
 L'API supporte une clé partagée optionnelle. Définissez `RAG_API_KEY` dans `.env` puis passez l'en-tête `X-API-Key` à chaque requête. L'interface Streamlit utilise automatiquement la clé si la variable `RAG_UI_API_KEY` est définie dans l'environnement de lancement.

@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 
 from pydantic import SecretStr
 
-from app.api import app, _load_settings
+from app.api import app, _load_settings, _safe_upload_path
 from app.core.config import get_settings
 
 
@@ -54,3 +54,10 @@ def test_api_key_is_required_when_configured() -> None:
         )
     finally:
         _reset_overrides()
+
+
+def test_upload_path_is_partitioned_by_content_hash() -> None:
+    destination = _safe_upload_path("contrat.pdf", "abc123")
+
+    assert destination.name == "contrat.pdf"
+    assert destination.parent.name == "abc123"

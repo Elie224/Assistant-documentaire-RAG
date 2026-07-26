@@ -53,8 +53,6 @@ class Settings(BaseSettings):
 
     api_key: SecretStr | None = None
 
-    api_key: SecretStr | None = None
-
     @model_validator(mode="after")
     def validate_chunking(self) -> "Settings":
         if self.chunk_overlap >= self.chunk_size:

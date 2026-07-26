@@ -1,0 +1,17 @@
+[
+  {
+    "question": "Quel est le montant de l'allocation annuelle pour l'équipement ?",
+    "expected_answer": "250 euros",
+    "expected_source": "demo.md"
+  },
+  {
+    "question": "Combien de jours de télétravail sont possibles chaque semaine ?",
+    "expected_answer": "trois jours",
+    "expected_source": "demo.md"
+  },
+  {
+    "question": "Quels sont les horaires du support informatique ?",
+    "expected_answer": "du lundi au vendredi, de 8 h 30 à 18 h",
+    "expected_source": "demo.md"
+  }
+]
