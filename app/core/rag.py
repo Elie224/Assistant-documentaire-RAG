@@ -16,6 +16,8 @@ from app.core.exceptions import EmptyIndexError
 from app.core.schemas import ChatMessage, ChatResponse, IngestionResponse, SourceChunk
 
 
+NO_ANSWER_MESSAGE = "Je ne trouve pas cette information dans les documents indexés."
+
 SYSTEM_PROMPT = """Tu es un assistant documentaire précis, naturel et chaleureux. Réponds uniquement à partir du contexte fourni.
 Si le contexte ne permet pas de répondre, dis clairement que l'information n'est pas présente dans les documents.
 Réponds en français, comme un humain, avec des phrases fluides et directes.
@@ -249,7 +251,7 @@ def _filter_scored_results(
 
 def _no_answer_response(settings: Settings) -> ChatResponse:
     return ChatResponse(
-        answer="Je ne trouve pas cette information dans les documents indexés.",
+        answer=NO_ANSWER_MESSAGE,
         sources=[],
         engine=settings.rag_engine,
         vector_store=settings.vector_store,
@@ -527,7 +529,7 @@ class LlamaIndexBackend:
             source_node
             for source_node in self.retrieve(enriched_question)
             if _score_is_allowed(
-                source_node.score,
+                _document_confidence(source_node.node, source_node.score),
                 self.settings.score_threshold,
                 allow_unscored=self.settings.embed_provider == "local-lite",
             )
@@ -614,19 +616,13 @@ def _retrieval_key(document) -> str:
     return hashlib.sha1(document.page_content.encode("utf-8")).hexdigest()
 
 
-def _evidence_by_key(results: list[tuple]) -> dict[str, float]:
-    scored = [
-        (_retrieval_key(document), float(score))
+def _bm25_confidence_by_key(results: list[tuple]) -> dict[str, float]:
+    """Convert positive BM25 evidence into a bounded, non-relative signal."""
+    return {
+        _retrieval_key(document): max(float(score), 0.0) / (1.0 + max(float(score), 0.0))
         for document, score in results
         if score is not None
-    ]
-    if not scored:
-        return {}
-    values = [score for _, score in scored]
-    low, high = min(values), max(values)
-    if high - low < 1e-9:
-        return {key: 1.0 if score > 0 else 0.0 for key, score in scored}
-    return {key: (score - low) / (high - low) for key, score in scored}
+    }
 
 
 def _hybrid_retrieve(
@@ -640,17 +636,17 @@ def _hybrid_retrieve(
     seen: dict[str, tuple[float, object, float | None]] = {}
     vector_weight = 1.0 - bm25_weight
     rrf_constant = 60
-    vector_evidence = _evidence_by_key(vector_results)
-    bm25_evidence = _evidence_by_key(bm25_results)
+    bm25_evidence = _bm25_confidence_by_key(bm25_results)
 
-    for rank, (document, _) in enumerate(vector_results, start=1):
+    for rank, (document, vector_score) in enumerate(vector_results, start=1):
         key = _retrieval_key(document)
         current_score, current_document, current_confidence = seen.get(
             key, (0.0, document, None)
         )
-        confidence = max(
-            [value for value in (current_confidence, vector_evidence.get(key)) if value is not None],
-            default=None,
+        confidence = (
+            current_confidence
+            if current_confidence is not None
+            else _document_confidence(document, vector_score)
         )
         seen[key] = (
             current_score + vector_weight / (rrf_constant + rank),
@@ -658,14 +654,15 @@ def _hybrid_retrieve(
             confidence,
         )
 
-    for rank, (document, _) in enumerate(bm25_results, start=1):
+    for rank, (document, bm25_score) in enumerate(bm25_results, start=1):
         key = _retrieval_key(document)
         current_score, current_document, current_confidence = seen.get(
             key, (0.0, document, None)
         )
-        confidence = max(
-            [value for value in (current_confidence, bm25_evidence.get(key)) if value is not None],
-            default=None,
+        confidence = (
+            current_confidence
+            if current_confidence is not None
+            else bm25_evidence.get(key)
         )
         seen[key] = (
             current_score + bm25_weight / (rrf_constant + rank),
