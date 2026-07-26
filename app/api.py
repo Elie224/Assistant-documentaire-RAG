@@ -1,5 +1,6 @@
 import hashlib
 import logging
+from collections import OrderedDict
 import re
 import secrets
 import time
@@ -36,7 +37,8 @@ _AUTH_ATTEMPTS: dict[str, list[float]] = {}
 _AUTH_ATTEMPTS_LOCK = Lock()
 _AUTH_RATE_LIMIT = 10
 _AUTH_RATE_WINDOW = 60.0
-_SERVICE_CACHE: dict[tuple[str, str, str, str, str, str, int, int], RagService] = {}
+_SERVICE_CACHE_MAXSIZE = 256
+_SERVICE_CACHE: OrderedDict[tuple, RagService] = OrderedDict()
 _SERVICE_CACHE_LOCK = Lock()
 
 
@@ -119,17 +121,31 @@ def get_rag_service(active_settings: Settings) -> RagService:
         active_settings.workspace_id,
         active_settings.rag_engine,
         active_settings.vector_store,
+        active_settings.llm_provider,
+        active_settings.llm_model,
+        active_settings.anthropic_model,
+        active_settings.ollama_llm_model,
         active_settings.embed_provider,
         active_settings.embed_model,
+        active_settings.ollama_embed_model,
         active_settings.local_semantic_model,
+        active_settings.local_embed_dimension,
         active_settings.chunk_size,
         active_settings.chunk_overlap,
+        active_settings.top_k,
+        active_settings.score_threshold,
+        active_settings.hybrid_search,
+        active_settings.bm25_weight,
     )
     with _SERVICE_CACHE_LOCK:
         service = _SERVICE_CACHE.get(cache_key)
         if service is None:
             service = RagService(active_settings)
             _SERVICE_CACHE[cache_key] = service
+            if len(_SERVICE_CACHE) > _SERVICE_CACHE_MAXSIZE:
+                _SERVICE_CACHE.popitem(last=False)
+            return service
+        _SERVICE_CACHE.move_to_end(cache_key)
         return service
 
 

@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     app_name: str = "Assistant RAG"
     environment: Literal["development", "test", "production"] = "development"
-    allow_unauthenticated: bool = True
+    allow_unauthenticated: bool = False
     workspace_id: str = Field(
         default="default",
         min_length=1,
@@ -80,6 +80,10 @@ class Settings(BaseSettings):
         if self.environment == "production" and self.allow_unauthenticated:
             raise ValueError(
                 "ALLOW_UNAUTHENTICATED doit être false en production."
+            )
+        if self.rag_engine == "llamaindex" and self.hybrid_search:
+            raise ValueError(
+                "HYBRID_SEARCH est disponible uniquement avec RAG_ENGINE=langchain."
             )
         return self
 

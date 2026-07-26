@@ -25,6 +25,7 @@ def test_index_is_separated_by_engine(tmp_path: Path) -> None:
     llamaindex = Settings(
         vector_store="faiss",
         rag_engine="llamaindex",
+        hybrid_search=False,
         faiss_dir=tmp_path,
     )
 
@@ -48,6 +49,11 @@ def test_anthropic_key_is_required() -> None:
 def test_overlap_must_be_smaller_than_chunk_size() -> None:
     with pytest.raises(ValueError, match="CHUNK_OVERLAP"):
         Settings(chunk_size=200, chunk_overlap=200)
+
+
+def test_llamaindex_rejects_hybrid_search_mode() -> None:
+    with pytest.raises(ValueError, match="HYBRID_SEARCH"):
+        Settings(rag_engine="llamaindex", hybrid_search=True)
 
 
 def test_workspace_isolates_custom_index_and_upload_paths(tmp_path: Path) -> None:

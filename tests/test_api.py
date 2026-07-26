@@ -12,7 +12,9 @@ from app.core.schemas import DocumentDeletionResponse, DocumentInfo, DocumentLis
 def _with_api_key(token: str | None) -> TestClient:
     base = get_settings()
     api_key = SecretStr(token) if token else None
-    overridden = base.model_copy(update={"api_key": api_key})
+    overridden = base.model_copy(
+        update={"api_key": api_key, "allow_unauthenticated": True}
+    )
     app.dependency_overrides[_load_settings] = lambda: overridden
     return TestClient(app)
 
@@ -285,7 +287,12 @@ def test_ingest_route_cleans_previous_upload_when_next_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = get_settings().model_copy(
-        update={"api_key": None, "api_key_workspaces": {}, "raw_data_dir": tmp_path / "raw"}
+        update={
+            "api_key": None,
+            "api_key_workspaces": {},
+            "allow_unauthenticated": True,
+            "raw_data_dir": tmp_path / "raw",
+        }
     )
     app.dependency_overrides[_load_settings] = lambda: settings
     saved: list[Path] = []
