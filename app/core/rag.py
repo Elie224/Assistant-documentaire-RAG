@@ -30,6 +30,18 @@ from app.core.schemas import (
 
 logger = logging.getLogger(__name__)
 
+_ACTIVE_DOCUMENT_STATUSES = (
+    "pending",
+    "processing",
+    "indexed",
+    "deleting",
+    "reindexing",
+)
+
+_TRANSIENT_DOCUMENT_STATUSES = ("pending", "processing", "deleting", "reindexing")
+_STATUS_RECOVERY_DONE: set[str] = set()
+_STATUS_RECOVERY_LOCK = Lock()
+
 
 NO_ANSWER_MESSAGE = "Je ne trouve pas cette information dans les documents indexés."
 
@@ -205,6 +217,21 @@ def _connect_registry(index_dir: Path) -> sqlite3.Connection:
     return connection
 
 
+def _recover_transient_statuses_once(index_dir: Path) -> None:
+    key = str(index_dir.resolve())
+    with _STATUS_RECOVERY_LOCK:
+        if key in _STATUS_RECOVERY_DONE:
+            return
+        _STATUS_RECOVERY_DONE.add(key)
+    placeholders = ",".join("?" for _ in _TRANSIENT_DOCUMENT_STATUSES)
+    with _connect_registry(index_dir) as connection:
+        connection.execute(
+            f"UPDATE documents SET status = 'failed' WHERE status IN ({placeholders})",
+            _TRANSIENT_DOCUMENT_STATUSES,
+        )
+        connection.commit()
+
+
 def _migrate_legacy_registry(index_dir: Path, connection: sqlite3.Connection) -> None:
     migrated = connection.execute(
         "SELECT 1 FROM registry_meta WHERE key = 'legacy_json_migrated'"
@@ -231,10 +258,13 @@ def _migrate_legacy_registry(index_dir: Path, connection: sqlite3.Connection) ->
 
 
 def _load_registry(index_dir: Path) -> _Registry:
+    _recover_transient_statuses_once(index_dir)
     with _connect_registry(index_dir) as connection:
         _migrate_legacy_registry(index_dir, connection)
+        placeholders = ",".join("?" for _ in _ACTIVE_DOCUMENT_STATUSES)
         rows = connection.execute(
-            "SELECT document_id, names_json, chunks FROM documents"
+            f"SELECT document_id, names_json, chunks FROM documents WHERE status IN ({placeholders})",
+            _ACTIVE_DOCUMENT_STATUSES,
         ).fetchall()
     return _Registry(
         {document_id: json.loads(names_json) for document_id, names_json, _ in rows},
@@ -244,8 +274,13 @@ def _load_registry(index_dir: Path) -> _Registry:
 
 def _save_registry(index_dir: Path, registry: dict[str, list[str]]) -> None:
     with _connect_registry(index_dir) as connection:
+        placeholders = ",".join("?" for _ in _ACTIVE_DOCUMENT_STATUSES)
         existing = {
-            row[0] for row in connection.execute("SELECT document_id FROM documents")
+            row[0]
+            for row in connection.execute(
+                f"SELECT document_id FROM documents WHERE status IN ({placeholders})",
+                _ACTIVE_DOCUMENT_STATUSES,
+            )
         }
         removed = existing - set(registry)
         if removed:
@@ -275,6 +310,37 @@ def _save_registry(index_dir: Path, registry: dict[str, list[str]]) -> None:
                     chunk_counts.get(document_id, 0),
                 )
                 for document_id, names in registry.items()
+            ],
+        )
+        connection.commit()
+
+
+def _set_document_statuses(
+    index_dir: Path,
+    document_ids: Iterable[str],
+    status: str,
+    names_by_id: dict[str, list[str]] | None = None,
+) -> None:
+    ids = [document_id for document_id in document_ids if document_id]
+    if not ids:
+        return
+    with _connect_registry(index_dir) as connection:
+        connection.executemany(
+            """INSERT INTO documents (document_id, names_json, chunks, status)
+               VALUES (?, ?, 0, ?)
+               ON CONFLICT(document_id) DO UPDATE SET
+                   names_json = CASE
+                       WHEN excluded.names_json != '[]' THEN excluded.names_json
+                       ELSE documents.names_json
+                   END,
+                   status = excluded.status""",
+            [
+                (
+                    document_id,
+                    json.dumps((names_by_id or {}).get(document_id, []), ensure_ascii=False),
+                    status,
+                )
+                for document_id in ids
             ],
         )
         connection.commit()
@@ -324,6 +390,7 @@ def _record_files(index_dir: Path, pairs: list[tuple[Path, str]]) -> None:
 
 
 def _registry_documents(index_dir: Path) -> DocumentListResponse:
+    _recover_transient_statuses_once(index_dir)
     with _connect_registry(index_dir) as connection:
         _migrate_legacy_registry(index_dir, connection)
         rows = connection.execute(
@@ -788,6 +855,7 @@ class LangChainBackend:
                     index_dir,
                     set(operation_ids.values()),
                 )
+            _set_document_statuses(index_dir, inserted_ids, "failed")
             raise
 
         with _registry_transaction(index_dir) as registry:
@@ -810,7 +878,6 @@ class LangChainBackend:
                     if chunk.metadata.get("document_id") in accepted_ids
                 ]
                 _record_registry_entries(registry, accepted_pairs, accepted_chunks)
-                _index_chunks_for_fts(index_dir, accepted_chunks)
 
         if duplicate_operation_ids:
             _remove_langchain_operation_ids(
@@ -821,12 +888,15 @@ class LangChainBackend:
             )
 
         if not accepted_ids:
-                return IngestionResponse(
-                    files=[],
-                    chunks=0,
-                    engine=self.settings.rag_engine,
-                    vector_store=self.settings.vector_store,
-                )
+            _set_document_statuses(index_dir, inserted_ids, "failed")
+            return IngestionResponse(
+                files=[],
+                chunks=0,
+                engine=self.settings.rag_engine,
+                vector_store=self.settings.vector_store,
+            )
+        _index_chunks_for_fts(index_dir, accepted_chunks)
+        _set_document_statuses(index_dir, accepted_ids, "indexed")
         return IngestionResponse(
             files=[path.name for path, _ in accepted_pairs],
             chunks=len(accepted_chunks),
@@ -845,6 +915,7 @@ class LangChainBackend:
             names = registry.get(document_id)
             if names is None:
                 return DocumentDeletionResponse(document_id=document_id, deleted=False)
+            _set_document_statuses(index_dir, [document_id], "deleting")
 
             store = self._store()
             if self.settings.vector_store == "chroma":
@@ -1032,6 +1103,7 @@ class LlamaIndexBackend:
                     _remove_llamaindex_document_ids(
                         index, self.settings.vector_store, index_dir, rollback_ids
                     )
+            _set_document_statuses(index_dir, inserted_ids, "failed")
             raise
 
         with _registry_transaction(index_dir) as registry:
@@ -1043,6 +1115,7 @@ class LlamaIndexBackend:
                 )
             accepted_ids = inserted_ids - duplicate_ids
             if not accepted_ids:
+                _set_document_statuses(index_dir, inserted_ids, "failed")
                 return IngestionResponse(
                     files=[],
                     chunks=0,
@@ -1056,13 +1129,15 @@ class LlamaIndexBackend:
                 if chunk.metadata.get("document_id") in accepted_ids
             ]
             _record_registry_entries(registry, accepted_pairs, accepted_chunks)
-            _index_chunks_for_fts(index_dir, accepted_chunks)
-            return IngestionResponse(
-                files=[path.name for path, _ in accepted_pairs],
-                chunks=len(accepted_chunks),
-                engine=self.settings.rag_engine,
-                vector_store=self.settings.vector_store,
-            )
+
+        _index_chunks_for_fts(index_dir, accepted_chunks)
+        _set_document_statuses(index_dir, accepted_ids, "indexed")
+        return IngestionResponse(
+            files=[path.name for path, _ in accepted_pairs],
+            chunks=len(accepted_chunks),
+            engine=self.settings.rag_engine,
+            vector_store=self.settings.vector_store,
+        )
 
     def retrieve(self, question: str) -> list[tuple]:
         index = self._index()
@@ -1080,6 +1155,7 @@ class LlamaIndexBackend:
             names = registry.get(document_id)
             if names is None:
                 return DocumentDeletionResponse(document_id=document_id, deleted=False)
+            _set_document_statuses(index_dir, [document_id], "deleting")
 
             index = self._index()
             index.delete_ref_doc(document_id, delete_from_docstore=True)
@@ -1195,8 +1271,11 @@ class RagService:
             )
             if document is None:
                 raise ValueError("Document introuvable.")
+            index_dir = self.backend._base_dir()
+            _set_document_statuses(index_dir, [document_id], "reindexing")
             paths = [self.settings.uploads_dir / document_id / name for name in document.names]
             if any(not path.is_file() for path in paths):
+                _set_document_statuses(index_dir, [document_id], "failed")
                 raise ValueError("Le fichier source du document est introuvable.")
 
             if isinstance(self.backend, LangChainBackend):
@@ -1222,6 +1301,7 @@ class RagService:
                             registry[document_id] = list(document.names)
                             if hasattr(registry, "chunk_counts"):
                                 registry.chunk_counts[document_id] = document.chunks
+                    _set_document_statuses(index_dir, [document_id], "indexed")
                     raise ValueError(
                         "La réindexation a échoué; ancienne version restaurée."
                     ) from error
@@ -1232,6 +1312,7 @@ class RagService:
             except Exception as error:
                 with suppress(Exception):
                     self.backend.ingest(paths)
+                _set_document_statuses(index_dir, [document_id], "failed")
                 raise ValueError(
                     "La réindexation a échoué; restauration automatique tentée."
                 ) from error
