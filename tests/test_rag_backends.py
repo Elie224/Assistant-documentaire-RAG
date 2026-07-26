@@ -206,6 +206,75 @@ def test_langchain_document_can_be_reindexed(
     assert source.exists()
 
 
+@pytest.mark.parametrize("store", ["chroma", "faiss"])
+def test_langchain_ingest_tags_chunks_with_operation_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: str
+) -> None:
+    source = tmp_path / "policy.txt"
+    source.write_text("L'allocation annuelle est de 250 euros.", encoding="utf-8")
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_embeddings", lambda settings: ConstantEmbeddings()
+    )
+    backend = LangChainBackend(backend_settings(tmp_path, "langchain", store))
+
+    backend.ingest([source])
+    store_obj = backend._store()
+
+    if store == "chroma":
+        payload = store_obj.get(where={"document_id": _file_hash(source)}, include=["metadatas"])
+        metadatas = payload.get("metadatas", [])
+        assert metadatas
+        assert all("operation_id" in (metadata or {}) for metadata in metadatas)
+    else:
+        metadatas = []
+        for item_id in store_obj.index_to_docstore_id.values():
+            document = store_obj.docstore.search(item_id)
+            metadata = getattr(document, "metadata", {})
+            if metadata.get("document_id") == _file_hash(source):
+                metadatas.append(metadata)
+        assert metadatas
+        assert all("operation_id" in metadata for metadata in metadatas)
+
+
+def test_langchain_reindex_restores_previous_version_on_ingest_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.rag import RagService
+
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_embeddings", lambda settings: ConstantEmbeddings()
+    )
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_llm",
+        lambda settings: FakeListChatModel(responses=["250 euros"]),
+    )
+    settings = backend_settings(tmp_path, "langchain", "chroma").model_copy(
+        update={"raw_data_dir": tmp_path / "raw"}
+    )
+    content = "L'allocation annuelle est de 250 euros."
+    seed = tmp_path / "seed.txt"
+    seed.write_text(content, encoding="utf-8")
+    document_id = _file_hash(seed)
+    source = settings.uploads_dir / document_id / "policy.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text(content, encoding="utf-8")
+
+    service = RagService(settings)
+    service.ingest([source])
+
+    def failing_ingest(paths: list[Path]):
+        del paths
+        raise ValueError("échec volontaire")
+
+    monkeypatch.setattr(service.backend, "ingest", failing_ingest)
+
+    with pytest.raises(ValueError, match="restaurée"):
+        service.reindex_document(document_id)
+
+    listing = service.list_documents()
+    assert listing.documents and listing.documents[0].document_id == document_id
+
+
 @pytest.mark.parametrize(
     ("engine", "store"),
     [

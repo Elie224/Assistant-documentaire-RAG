@@ -6,6 +6,7 @@ import re
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from threading import Lock
@@ -407,6 +408,79 @@ def _remove_langchain_document_ids(
         store.save_local(str(index_dir))
 
 
+def _remove_langchain_operation_ids(
+    store,
+    vector_store: str,
+    index_dir: Path,
+    operation_ids: set[str],
+) -> None:
+    if not operation_ids:
+        return
+    if vector_store == "chroma":
+        ids_to_delete: list[str] = []
+        for operation_id in operation_ids:
+            ids_to_delete.extend(
+                store.get(where={"operation_id": operation_id}, include=[]).get(
+                    "ids", []
+                )
+            )
+        if ids_to_delete:
+            store.delete(ids=list(dict.fromkeys(ids_to_delete)))
+        return
+
+    ids_to_delete = []
+    for item_id in store.index_to_docstore_id.values():
+        document = store.docstore.search(item_id)
+        metadata = getattr(document, "metadata", {})
+        if metadata.get("operation_id") in operation_ids:
+            ids_to_delete.append(item_id)
+    if ids_to_delete:
+        store.delete(ids_to_delete)
+        store.save_local(str(index_dir))
+
+
+def _snapshot_langchain_document(
+    store,
+    vector_store: str,
+    document_id: str,
+    names: list[str],
+) -> list:
+    del names
+    if vector_store == "chroma":
+        payload = store.get(
+            where={"document_id": document_id}, include=["documents", "metadatas"]
+        )
+        documents = payload.get("documents", []) or []
+        metadatas = payload.get("metadatas", []) or []
+        from langchain_core.documents import Document
+
+        return [
+            Document(page_content=text or "", metadata=metadata or {})
+            for text, metadata in zip(documents, metadatas)
+        ]
+
+    snapshots = []
+    for item_id in store.index_to_docstore_id.values():
+        document = store.docstore.search(item_id)
+        metadata = getattr(document, "metadata", {})
+        if metadata.get("document_id") == document_id:
+            snapshots.append(document)
+    return snapshots
+
+
+def _restore_langchain_snapshot(
+    store,
+    vector_store: str,
+    index_dir: Path,
+    snapshot: list,
+) -> None:
+    if not snapshot:
+        return
+    store.add_documents(snapshot)
+    if vector_store == "faiss":
+        store.save_local(str(index_dir))
+
+
 def _remove_llamaindex_document_ids(
     index,
     vector_store: str,
@@ -590,6 +664,7 @@ class LangChainBackend:
         from app.core.providers import get_langchain_embeddings
 
         index_dir = self._ensure_dir()
+        operation_id = uuid.uuid4().hex
         with _registry_transaction(index_dir) as registry:
             kept, pairs = _split_new_paths(paths, registry)
         if not kept:
@@ -603,6 +678,8 @@ class LangChainBackend:
         chunks = _chunks_with_document_ids(kept, pairs, self.settings)
         if not chunks:
             raise ValueError("Les documents ne contiennent aucun texte exploitable.")
+        for chunk in chunks:
+            chunk.metadata["operation_id"] = operation_id
 
         if self.settings.vector_store == "faiss" and not (index_dir / "index.faiss").exists():
             from langchain_community.vectorstores import FAISS
@@ -624,16 +701,22 @@ class LangChainBackend:
                 store.save_local(str(index_dir))
         except Exception:
             with suppress(Exception):
-                _remove_langchain_document_ids(
-                    store, self.settings.vector_store, index_dir, inserted_ids
+                _remove_langchain_operation_ids(
+                    store,
+                    self.settings.vector_store,
+                    index_dir,
+                    {operation_id},
                 )
             raise
 
         with _registry_transaction(index_dir) as registry:
             duplicate_ids = {digest for _, digest in pairs if digest in registry}
             if duplicate_ids:
-                _remove_langchain_document_ids(
-                    store, self.settings.vector_store, index_dir, duplicate_ids
+                _remove_langchain_operation_ids(
+                    store,
+                    self.settings.vector_store,
+                    index_dir,
+                    {operation_id},
                 )
             accepted_ids = inserted_ids - duplicate_ids
             if not accepted_ids:
@@ -1007,6 +1090,33 @@ class RagService:
             paths = [self.settings.uploads_dir / document_id / name for name in document.names]
             if any(not path.is_file() for path in paths):
                 raise ValueError("Le fichier source du document est introuvable.")
+
+            if isinstance(self.backend, LangChainBackend):
+                index_dir = self.backend._base_dir()
+                store = self.backend._store()
+                snapshot = _snapshot_langchain_document(
+                    store, self.settings.vector_store, document_id, document.names
+                )
+                try:
+                    self.backend.delete_document(document_id, remove_upload=False)
+                    return self.backend.ingest(paths)
+                except Exception as error:
+                    with suppress(Exception):
+                        _restore_langchain_snapshot(
+                            store,
+                            self.settings.vector_store,
+                            index_dir,
+                            snapshot,
+                        )
+                    with suppress(Exception):
+                        with _registry_transaction(index_dir) as registry:
+                            registry[document_id] = list(document.names)
+                            if hasattr(registry, "chunk_counts"):
+                                registry.chunk_counts[document_id] = document.chunks
+                    raise ValueError(
+                        "La réindexation a échoué; ancienne version restaurée."
+                    ) from error
+
             try:
                 self.backend.delete_document(document_id, remove_upload=False)
                 return self.backend.ingest(paths)
