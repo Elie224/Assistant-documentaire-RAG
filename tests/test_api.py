@@ -107,7 +107,8 @@ def test_document_lifecycle_routes(monkeypatch: pytest.MonkeyPatch) -> None:
         assert listing.status_code == 200
         assert listing.json()["documents"][0]["document_id"] == document_id
         assert client.post(f"/documents/{document_id}/reindex").status_code == 200
-        assert client.post(f"/documents/{"b" * 64}/reindex").status_code == 404
+        invalid_document_id = "b" * 64
+        assert client.post(f"/documents/{invalid_document_id}/reindex").status_code == 404
         assert client.delete(f"/documents/{document_id}").status_code == 200
         assert client.delete(f"/documents/{'b' * 64}").status_code == 404
         assert client.delete("/documents/not-a-hash").status_code == 400
