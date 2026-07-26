@@ -184,36 +184,38 @@ class LangChainBackend:
 
     def _search(self, question: str, store) -> list[tuple]:
         if self.settings.embed_provider == "local-lite":
-            vector_results = [
-                (doc, None)
-                for doc in store.similarity_search(question, k=self.settings.top_k)
-            ]
+            candidates = store.similarity_search(question, k=self.settings.top_k)
         else:
             try:
-                vector_results = store.similarity_search_with_relevance_scores(
+                scored = store.similarity_search_with_relevance_scores(
                     question, k=self.settings.top_k
                 )
             except (NotImplementedError, ValueError):
-                vector_results = [
+                scored = [
                     (doc, None)
                     for doc in store.similarity_search(question, k=self.settings.top_k)
                 ]
+            candidates = [doc for doc, _ in scored]
+            return scored
         if not self.settings.hybrid_search or self.settings.vector_store != "chroma":
-            return vector_results
+            return [(doc, 1.0) for doc in candidates]
         try:
-            candidate_pool = store.similarity_search(
+            bm25_results = _bm25_search(question, candidates, self.settings.top_k)
+        except Exception:
+            return [(doc, 1.0) for doc in candidates]
+        if not bm25_results:
+            return [(doc, 1.0) for doc in candidates]
+        try:
+            enriched_pool = store.similarity_search(
                 question, k=max(self.settings.top_k * 4, 12)
             )
         except Exception:
-            return vector_results
-        try:
-            bm25_results = _bm25_search(question, candidate_pool, self.settings.top_k)
-        except Exception:
-            return vector_results
+            enriched_pool = candidates
         return _hybrid_retrieve(
             question,
-            vector_results,
+            [(doc, 1.0) for doc in candidates],
             bm25_results,
+            enriched_pool,
             self.settings.top_k,
             self.settings.bm25_weight,
         )
@@ -528,6 +530,7 @@ def _hybrid_retrieve(
     question: str,
     vector_results: list[tuple],
     bm25_results: list[tuple],
+    enriched_pool: list,
     top_k: int,
     bm25_weight: float,
 ) -> list[tuple]:
@@ -549,5 +552,11 @@ def _hybrid_retrieve(
             seen[key] = (max(seen[key][0], weighted), doc_existing)
         else:
             seen[key] = (weighted, doc)
+    # Include any candidate from the enriched pool that wasn't already seen,
+    # to keep semantic diversity when BM25 misses a query.
+    for doc in enriched_pool:
+        key = hashlib.sha1(doc.page_content.encode("utf-8")).hexdigest()
+        if key not in seen:
+            seen[key] = (0.0, doc)
     ranked = sorted(seen.items(), key=lambda item: item[1][0], reverse=True)[:top_k]
     return [(doc, score) for _, (score, doc) in ranked]
