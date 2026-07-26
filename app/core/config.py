@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     chroma_dir: Path = Path("./data/index/chroma")
     faiss_dir: Path = Path("./data/index/faiss")
     raw_data_dir: Path = Path("./data/raw")
+    auth_db_path: Path = Path("./data/auth.sqlite3")
+    session_ttl_hours: int = Field(default=24, ge=1, le=720)
 
     chunk_size: int = Field(default=800, ge=100, le=8000)
     chunk_overlap: int = Field(default=120, ge=0, le=2000)
@@ -58,7 +60,16 @@ class Settings(BaseSettings):
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
 
-    api_key: SecretStr | None = None
+    api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RAG_API_KEY", "API_KEY", "api_key"),
+    )
+    api_key_workspaces: dict[str, list[str]] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices(
+            "RAG_API_KEY_WORKSPACES", "API_KEY_WORKSPACES", "api_key_workspaces"
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_chunking(self) -> "Settings":

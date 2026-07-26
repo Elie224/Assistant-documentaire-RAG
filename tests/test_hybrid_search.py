@@ -158,3 +158,59 @@ def test_bm25_tokenizer_handles_french_punctuation() -> None:
         "est",
         "ouvert",
     ]
+
+def test_local_lite_unscored_results_use_fallback_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.documents import Document
+
+    recording_llm = RecordingLLM()
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_llm", lambda settings: recording_llm
+    )
+    settings = Settings(
+        llm_provider="ollama",
+        embed_provider="local-lite",
+        score_threshold=0.25,
+        local_embed_dimension=128,
+    )
+    backend = LangChainBackend(settings)
+    relevant = Document(
+        page_content="L'allocation annuelle est de 250 euros.",
+        metadata={"source": "policy.txt"},
+    )
+    backend.retrieve = lambda question: [(relevant, None)]
+
+    response = backend.ask("Quel est le montant de l'allocation annuelle ?", [])
+
+    assert response.sources[0].source == "policy.txt"
+    assert response.sources[0].confidence is not None
+    assert response.sources[0].confidence >= settings.score_threshold
+
+
+def test_local_lite_unscored_irrelevant_results_are_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.documents import Document
+
+    recording_llm = RecordingLLM()
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_llm", lambda settings: recording_llm
+    )
+    settings = Settings(
+        llm_provider="ollama",
+        embed_provider="local-lite",
+        score_threshold=0.25,
+        local_embed_dimension=128,
+    )
+    backend = LangChainBackend(settings)
+    irrelevant = Document(
+        page_content="Le support technique ouvre à huit heures.",
+        metadata={"source": "support.txt"},
+    )
+    backend.retrieve = lambda question: [(irrelevant, None)]
+
+    response = backend.ask("Quel est le montant de l'allocation annuelle ?", [])
+
+    assert response.sources == []
+    assert recording_llm.prompts == []

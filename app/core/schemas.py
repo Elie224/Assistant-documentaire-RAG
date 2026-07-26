@@ -42,3 +42,49 @@ class HealthResponse(BaseModel):
     vector_store: str
     llm_provider: str
     embed_provider: str
+
+
+class DocumentInfo(BaseModel):
+    document_id: str
+    names: list[str]
+    created_at: str
+    chunks: int
+    status: Literal["indexed"] = "indexed"
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentInfo]
+
+
+class DocumentDeletionResponse(BaseModel):
+    document_id: str
+    deleted: bool
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+    password: str = Field(min_length=8, max_length=256)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=320)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    user_id: str
+    workspace_id: str
+
+
+class UserResponse(BaseModel):
+    user_id: str
+    email: str
+    workspace_id: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)

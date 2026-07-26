@@ -131,12 +131,29 @@ Changez de modèle Claude avec `ANTHROPIC_MODEL`, de modèle OpenAI avec `LLM_MO
 
 ## API
 
+- `POST /auth/register` et `POST /auth/login` : créent une session Bearer utilisateur ;
+- `POST /auth/logout` : révoque la session courante ;
+- `POST /auth/password` : change le mot de passe et révoque toutes les sessions existantes ;
+- `GET /auth/me` : retourne l’utilisateur et son workspace ;
 - `GET /health` : affiche la pile active ;
+- `GET /documents` : liste les documents du workspace avec leur identifiant stable ;
 - `POST /documents/ingest` : importe et indexe une liste de fichiers ;
+- `DELETE /documents/{document_id}` : supprime un document, ses chunks et son fichier importé ;
+- `POST /documents/{document_id}/reindex` : reconstruit les chunks et embeddings depuis le fichier importé ;
 - `POST /chat` : répond à une question avec les extraits sources ;
 - `GET /docs` : interface Swagger générée automatiquement.
 
 L'API accepte l'en-tête optionnel `X-Workspace-ID`. Sa valeur par défaut est `default`, qui conserve les chemins historiques. Pour un workspace personnalisé, les uploads et index sont isolés dans des sous-dossiers dédiés. L'interface Streamlit transmet `RAG_WORKSPACE_ID` automatiquement.
+
+Les comptes SaaS sont stockés dans SQLite (`AUTH_DB_PATH`). L’inscription retourne un `access_token` et un `workspace_id`. Pour les routes métier, envoyez `Authorization: Bearer <access_token>` et `X-Workspace-ID` avec le workspace retourné ; un autre workspace est refusé avec `403`. Les mots de passe ne sont jamais stockés en clair. Les tentatives d’inscription et de connexion sont limitées à 10 par minute et par adresse IP.
+
+Pour un déploiement multi-workspace, configurez `RAG_API_KEY_WORKSPACES` avec une matrice JSON associant chaque clé aux workspaces autorisés :
+
+```env
+RAG_API_KEY_WORKSPACES={"team-a-token":["team-a"],"admin-token":["*"]}
+```
+
+Lorsqu'elle est définie, cette matrice remplace la clé partagée : une clé inconnue reçoit `401` et une clé valide visant un workspace non autorisé reçoit `403`. Le mode historique `RAG_API_KEY` reste disponible pour les installations mono-workspace.
 Exemple de question :
 
 ```powershell

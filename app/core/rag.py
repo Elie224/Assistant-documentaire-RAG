@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import os
+import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -13,7 +14,16 @@ from typing import Iterable, Protocol
 from app.core.config import Settings, get_settings
 from app.core.documents import load_documents, split_documents
 from app.core.exceptions import EmptyIndexError
-from app.core.schemas import ChatMessage, ChatResponse, IngestionResponse, SourceChunk
+from app.core.local_embeddings import _hash_vector
+from app.core.schemas import (
+    ChatMessage,
+    ChatResponse,
+    DocumentDeletionResponse,
+    DocumentInfo,
+    DocumentListResponse,
+    IngestionResponse,
+    SourceChunk,
+)
 
 
 NO_ANSWER_MESSAGE = "Je ne trouve pas cette information dans les documents indexés."
@@ -40,6 +50,12 @@ class RagBackend(Protocol):
     def retrieve(self, question: str) -> list[tuple]: ...
 
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse: ...
+
+    def list_documents(self) -> DocumentListResponse: ...
+
+    def delete_document(
+        self, document_id: str, remove_upload: bool = True
+    ) -> DocumentDeletionResponse: ...
 
 
 def _history_text(history: Iterable[ChatMessage]) -> str:
@@ -72,7 +88,17 @@ def _file_hash(path: Path) -> str:
 
 
 def _registry_path(index_dir: Path) -> Path:
+    return index_dir / "documents.sqlite3"
+
+
+def _legacy_registry_path(index_dir: Path) -> Path:
     return index_dir / "indexed_files.json"
+
+
+class _Registry(dict[str, list[str]]):
+    def __init__(self, *args, chunk_counts: dict[str, int] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.chunk_counts = chunk_counts or {}
 
 
 _REGISTRY_LOCKS: dict[str, Lock] = {}
@@ -146,25 +172,96 @@ def _registry_transaction(index_dir: Path, max_wait: float = 5.0):
         lock.release()
 
 
-def _load_registry(index_dir: Path) -> dict[str, list[str]]:
-    path = _registry_path(index_dir)
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+def _connect_registry(index_dir: Path) -> sqlite3.Connection:
+    index_dir.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(_registry_path(index_dir))
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS documents (
+            document_id TEXT PRIMARY KEY,
+            names_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            chunks INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'indexed'
+        )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS registry_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )"""
+    )
+    return connection
+
+
+def _migrate_legacy_registry(index_dir: Path, connection: sqlite3.Connection) -> None:
+    migrated = connection.execute(
+        "SELECT 1 FROM registry_meta WHERE key = 'legacy_json_migrated'"
+    ).fetchone()
+    if migrated:
+        return
+    legacy_path = _legacy_registry_path(index_dir)
+    if legacy_path.exists():
+        try:
+            legacy = json.loads(legacy_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            legacy = {}
+        connection.executemany(
+            "INSERT OR IGNORE INTO documents (document_id, names_json) VALUES (?, ?)",
+            [
+                (document_id, json.dumps(names, ensure_ascii=False))
+                for document_id, names in legacy.items()
+            ],
+        )
+    connection.execute(
+        "INSERT INTO registry_meta (key, value) VALUES ('legacy_json_migrated', '1')"
+    )
+    connection.commit()
+
+
+def _load_registry(index_dir: Path) -> _Registry:
+    with _connect_registry(index_dir) as connection:
+        _migrate_legacy_registry(index_dir, connection)
+        rows = connection.execute(
+            "SELECT document_id, names_json, chunks FROM documents"
+        ).fetchall()
+    return _Registry(
+        {document_id: json.loads(names_json) for document_id, names_json, _ in rows},
+        chunk_counts={document_id: chunks for document_id, _, chunks in rows},
+    )
 
 
 def _save_registry(index_dir: Path, registry: dict[str, list[str]]) -> None:
-    target = _registry_path(index_dir)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + ".tmp")
-    temp.write_text(
-        json.dumps(registry, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-    os.replace(temp, target)
-
+    with _connect_registry(index_dir) as connection:
+        existing = {
+            row[0] for row in connection.execute("SELECT document_id FROM documents")
+        }
+        removed = existing - set(registry)
+        if removed:
+            connection.executemany(
+                "DELETE FROM documents WHERE document_id = ?",
+                [(document_id,) for document_id in removed],
+            )
+        chunk_counts = getattr(registry, "chunk_counts", {})
+        connection.executemany(
+            """INSERT INTO documents (document_id, names_json, chunks)
+               VALUES (?, ?, ?)
+               ON CONFLICT(document_id) DO UPDATE SET
+                   names_json = excluded.names_json,
+                   chunks = CASE
+                       WHEN excluded.chunks > 0 THEN excluded.chunks
+                       ELSE documents.chunks
+                   END,
+                   status = 'indexed'""",
+            [
+                (
+                    document_id,
+                    json.dumps(names, ensure_ascii=False),
+                    chunk_counts.get(document_id, 0),
+                )
+                for document_id, names in registry.items()
+            ],
+        )
+        connection.commit()
 
 def _split_new_paths(
     paths: list[Path], registry: dict[str, list[str]]
@@ -186,12 +283,21 @@ def _split_new_paths(
 
 
 def _record_registry_entries(
-    registry: dict[str, list[str]], pairs: list[tuple[Path, str]]
+    registry: dict[str, list[str]],
+    pairs: list[tuple[Path, str]],
+    chunks: list | None = None,
 ) -> None:
     for path, digest in pairs:
         names = registry.setdefault(digest, [])
         if path.name not in names:
             names.append(path.name)
+    if chunks is not None and hasattr(registry, "chunk_counts"):
+        counts: dict[str, int] = {}
+        for chunk in chunks:
+            document_id = chunk.metadata.get("document_id")
+            if document_id:
+                counts[document_id] = counts.get(document_id, 0) + 1
+        registry.chunk_counts.update(counts)
 
 
 def _record_files(index_dir: Path, pairs: list[tuple[Path, str]]) -> None:
@@ -199,6 +305,50 @@ def _record_files(index_dir: Path, pairs: list[tuple[Path, str]]) -> None:
         return
     with _registry_transaction(index_dir) as registry:
         _record_registry_entries(registry, pairs)
+
+
+def _registry_documents(index_dir: Path) -> DocumentListResponse:
+    with _connect_registry(index_dir) as connection:
+        _migrate_legacy_registry(index_dir, connection)
+        rows = connection.execute(
+            """SELECT document_id, names_json, created_at, chunks, status
+               FROM documents ORDER BY created_at, document_id"""
+        ).fetchall()
+    return DocumentListResponse(
+        documents=[
+            DocumentInfo(
+                document_id=document_id,
+                names=sorted(json.loads(names_json)),
+                created_at=created_at,
+                chunks=chunks,
+                status=status,
+            )
+            for document_id, names_json, created_at, chunks, status in rows
+        ]
+    )
+
+
+def _chunks_with_document_ids(
+    paths: list[Path], pairs: list[tuple[Path, str]], settings: Settings
+) -> list:
+    document_ids = {path: document_id for path, document_id in pairs}
+    chunks = []
+    for path in paths:
+        current_chunks = split_documents(load_documents([path]), settings)
+        for chunk in current_chunks:
+            chunk.metadata["document_id"] = document_ids[path]
+        chunks.extend(current_chunks)
+    return chunks
+
+
+def _remove_uploaded_document(settings: Settings, document_id: str, names: list[str]) -> None:
+    document_dir = settings.uploads_dir / document_id
+    for name in names:
+        candidate = document_dir / Path(name).name
+        if candidate.is_file():
+            candidate.unlink()
+    if document_dir.is_dir() and not any(document_dir.iterdir()):
+        document_dir.rmdir()
 
 
 def _document_confidence(document, score: float | None) -> float | None:
@@ -213,6 +363,33 @@ def _annotate_vector_confidence(results: list[tuple]) -> None:
         confidence = _document_confidence(document, score)
         if confidence is not None:
             document.metadata["_retrieval_confidence"] = confidence
+
+
+def _local_lite_confidence(question: str, text: str, dimension: int) -> float:
+    query_vector = _hash_vector(question, dimension)
+    text_vector = _hash_vector(text, dimension)
+    return max(
+        0.0,
+        min(
+            1.0,
+            sum(
+                query_value * text_value
+                for query_value, text_value in zip(
+                    query_vector, text_vector, strict=True
+                )
+            ),
+        ),
+    )
+
+
+def _annotate_local_lite_confidence(
+    question: str, results: list[tuple], dimension: int
+) -> None:
+    for document, score in results:
+        if _document_confidence(document, score) is None:
+            document.metadata["_retrieval_confidence"] = _local_lite_confidence(
+                question, document.page_content, dimension
+            )
 
 
 def _filter_sources(
@@ -343,8 +520,7 @@ class LangChainBackend:
                     engine=self.settings.rag_engine,
                     vector_store=self.settings.vector_store,
                 )
-            documents = load_documents(kept)
-            chunks = split_documents(documents, self.settings)
+            chunks = _chunks_with_document_ids(kept, pairs, self.settings)
             if not chunks:
                 raise ValueError("Les documents ne contiennent aucun texte exploitable.")
 
@@ -362,7 +538,7 @@ class LangChainBackend:
                     store = FAISS.from_documents(chunks, embeddings)
                 store.save_local(str(index_dir))
 
-            _record_registry_entries(registry, pairs)
+            _record_registry_entries(registry, pairs, chunks)
             return IngestionResponse(
                 files=[path.name for path in kept],
                 chunks=len(chunks),
@@ -370,14 +546,60 @@ class LangChainBackend:
                 vector_store=self.settings.vector_store,
             )
 
+    def list_documents(self) -> DocumentListResponse:
+        return _registry_documents(self._base_dir())
+
+    def delete_document(
+        self, document_id: str, remove_upload: bool = True
+    ) -> DocumentDeletionResponse:
+        index_dir = self._base_dir()
+        with _registry_transaction(index_dir) as registry:
+            names = registry.get(document_id)
+            if names is None:
+                return DocumentDeletionResponse(document_id=document_id, deleted=False)
+
+            store = self._store()
+            if self.settings.vector_store == "chroma":
+                ids = store.get(where={"document_id": document_id}, include=[]).get(
+                    "ids", []
+                )
+                if not ids:
+                    for name in names:
+                        ids.extend(
+                            store.get(where={"source": name}, include=[]).get("ids", [])
+                        )
+                if ids:
+                    store.delete(ids=list(dict.fromkeys(ids)))
+            else:
+                ids = []
+                for item_id in store.index_to_docstore_id.values():
+                    document = store.docstore.search(item_id)
+                    metadata = getattr(document, "metadata", {})
+                    if metadata.get("document_id") == document_id or metadata.get(
+                        "source"
+                    ) in names:
+                        ids.append(item_id)
+                if ids:
+                    store.delete(ids)
+                    store.save_local(str(index_dir))
+
+            registry.pop(document_id)
+            if remove_upload:
+                _remove_uploaded_document(self.settings, document_id, names)
+        return DocumentDeletionResponse(document_id=document_id, deleted=True)
+
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse:
         from app.core.providers import get_langchain_llm
 
         scored = self.retrieve(question)
+        if self.settings.embed_provider == "local-lite":
+            _annotate_local_lite_confidence(
+                question, scored, self.settings.local_embed_dimension
+            )
         filtered_scored = _filter_scored_results(
             scored,
             self.settings.score_threshold,
-            allow_unscored=self.settings.embed_provider == "local-lite",
+            allow_unscored=False,
         )
         if not filtered_scored:
             return _no_answer_response(self.settings)
@@ -489,20 +711,23 @@ class LlamaIndexBackend:
                     engine=self.settings.rag_engine,
                     vector_store=self.settings.vector_store,
                 )
-            documents = load_documents(kept)
-            chunks = split_documents(documents, self.settings)
+            chunks = _chunks_with_document_ids(kept, pairs, self.settings)
             if not chunks:
                 raise ValueError("Les documents ne contiennent aucun texte exploitable.")
 
             index = self._index(create=True)
             nodes = [
-                TextNode(text=chunk.page_content, metadata=dict(chunk.metadata))
+                TextNode(
+                    text=chunk.page_content,
+                    metadata=dict(chunk.metadata),
+                    ref_doc_id=str(chunk.metadata["document_id"]),
+                )
                 for chunk in chunks
             ]
             index.insert_nodes(nodes)
             if self.settings.vector_store == "faiss":
                 index.storage_context.persist(persist_dir=str(self._base_dir()))
-            _record_registry_entries(registry, pairs)
+            _record_registry_entries(registry, pairs, chunks)
             return IngestionResponse(
                 files=[path.name for path in kept],
                 chunks=len(chunks),
@@ -515,23 +740,47 @@ class LlamaIndexBackend:
         retriever = index.as_retriever(similarity_top_k=self.settings.top_k)
         return retriever.retrieve(question)
 
+    def list_documents(self) -> DocumentListResponse:
+        return _registry_documents(self._base_dir())
+
+    def delete_document(
+        self, document_id: str, remove_upload: bool = True
+    ) -> DocumentDeletionResponse:
+        index_dir = self._base_dir()
+        with _registry_transaction(index_dir) as registry:
+            names = registry.get(document_id)
+            if names is None:
+                return DocumentDeletionResponse(document_id=document_id, deleted=False)
+
+            index = self._index()
+            index.delete_ref_doc(document_id, delete_from_docstore=True)
+            if self.settings.vector_store == "faiss":
+                index.storage_context.persist(persist_dir=str(index_dir))
+            registry.pop(document_id)
+            if remove_upload:
+                _remove_uploaded_document(self.settings, document_id, names)
+        return DocumentDeletionResponse(document_id=document_id, deleted=True)
+
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse:
         from app.core.providers import get_llamaindex_llm
-
-        enriched_question = (
-            "Réponds en français, naturellement, uniquement à partir des documents. "
-            "Si l'information manque, indique-le. Les sources sont affichées séparément : "
-            "n'ajoute aucun numéro, crochet ou marqueur de citation dans la réponse.\n"
-            f"Historique récent:\n{_history_text(history)}\n"
-            f"Question: {question}"
-        )
+        retrieved_nodes = self.retrieve(question)
+        if self.settings.embed_provider == "local-lite":
+            for source_node in retrieved_nodes:
+                if _document_confidence(source_node.node, source_node.score) is None:
+                    source_node.node.metadata["_retrieval_confidence"] = (
+                        _local_lite_confidence(
+                            question,
+                            source_node.node.get_content(),
+                            self.settings.local_embed_dimension,
+                        )
+                    )
         selected_nodes = [
             source_node
-            for source_node in self.retrieve(enriched_question)
+            for source_node in retrieved_nodes
             if _score_is_allowed(
                 _document_confidence(source_node.node, source_node.score),
                 self.settings.score_threshold,
-                allow_unscored=self.settings.embed_provider == "local-lite",
+                allow_unscored=False,
             )
         ]
         if not selected_nodes:
@@ -588,6 +837,30 @@ class RagService:
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse:
         with self._lock:
             return self.backend.ask(question, history)
+
+
+    def list_documents(self) -> DocumentListResponse:
+        with self._lock:
+            return self.backend.list_documents()
+
+    def delete_document(self, document_id: str) -> DocumentDeletionResponse:
+        with self._lock:
+            return self.backend.delete_document(document_id)
+
+    def reindex_document(self, document_id: str) -> IngestionResponse:
+        with self._lock:
+            listing = self.backend.list_documents()
+            document = next(
+                (item for item in listing.documents if item.document_id == document_id),
+                None,
+            )
+            if document is None:
+                raise ValueError("Document introuvable.")
+            paths = [self.settings.uploads_dir / document_id / name for name in document.names]
+            if any(not path.is_file() for path in paths):
+                raise ValueError("Le fichier source du document est introuvable.")
+            self.backend.delete_document(document_id, remove_upload=False)
+            return self.backend.ingest(paths)
 
 
 _BM25_TOKEN_PATTERN = re.compile(r"\b[\wÀ-ÿ'-]+\b", re.UNICODE)

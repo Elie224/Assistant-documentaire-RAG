@@ -66,3 +66,19 @@ def test_workspace_isolates_custom_index_and_upload_paths(tmp_path: Path) -> Non
 def test_workspace_id_rejects_path_traversal() -> None:
     with pytest.raises(ValueError, match="workspace"):
         Settings().for_workspace("../other")
+
+
+def test_security_settings_accept_documented_rag_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RAG_API_KEY", "shared-secret")
+    monkeypatch.setenv(
+        "RAG_API_KEY_WORKSPACES",
+        '{"team-a-token":["team-a"],"admin-token":["*"]}',
+    )
+
+    settings = Settings(_env_file=None)
+
+    assert settings.api_key is not None
+    assert settings.api_key.get_secret_value() == "shared-secret"
+    assert settings.api_key_workspaces["team-a-token"] == ["team-a"]

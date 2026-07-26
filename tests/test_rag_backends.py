@@ -109,7 +109,10 @@ def test_llamaindex_generation_uses_filtered_nodes_once(
             return "Le télétravail est possible trois jours par semaine."
 
     class Retriever:
+        questions: list[str] = []
+
         def retrieve(self, question: str):
+            self.questions.append(question)
             return [SimpleNamespace(node=Node(), score=0.9)]
 
     class Index:
@@ -136,6 +139,67 @@ def test_llamaindex_generation_uses_filtered_nodes_once(
     response = backend.ask("Combien de jours ?", [])
 
     assert llm.calls == 1
+    assert Retriever.questions == ["Combien de jours ?"]
     assert response.sources[0].source == "policy.md"
     assert "Trois jours" in response.answer
     assert "télétravail" in llm.prompt
+
+
+@pytest.mark.parametrize("store", ["chroma", "faiss"])
+def test_langchain_documents_can_be_listed_and_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, store: str
+) -> None:
+    source = tmp_path / "policy.txt"
+    source.write_text("L'allocation annuelle est de 250 euros.", encoding="utf-8")
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_embeddings", lambda settings: ConstantEmbeddings()
+    )
+    settings = backend_settings(tmp_path, "langchain", store).model_copy(
+        update={"raw_data_dir": tmp_path / "raw"}
+    )
+    backend = LangChainBackend(settings)
+
+    backend.ingest([source])
+    document_id = _file_hash(source)
+
+    listing = backend.list_documents()
+    assert [(item.document_id, item.names) for item in listing.documents] == [
+        (document_id, ["policy.txt"])
+    ]
+    assert listing.documents[0].chunks == 1
+    assert listing.documents[0].status == "indexed"
+    assert listing.documents[0].created_at
+
+    deletion = backend.delete_document(document_id)
+
+    assert deletion.deleted is True
+    assert backend.list_documents().documents == []
+    assert backend.delete_document(document_id).deleted is False
+
+
+def test_langchain_document_can_be_reindexed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.rag import RagService
+
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_embeddings", lambda settings: ConstantEmbeddings()
+    )
+    settings = backend_settings(tmp_path, "langchain", "faiss").model_copy(
+        update={"raw_data_dir": tmp_path / "raw"}
+    )
+    content = "L'allocation annuelle est de 250 euros."
+    source_seed = tmp_path / "source.txt"
+    source_seed.write_text(content, encoding="utf-8")
+    document_id = _file_hash(source_seed)
+    source = settings.uploads_dir / document_id / "policy.txt"
+    source.parent.mkdir(parents=True)
+    source.write_text(content, encoding="utf-8")
+    backend = LangChainBackend(settings)
+    backend.ingest([source])
+
+    response = RagService(settings).reindex_document(document_id)
+
+    assert response.files == ["policy.txt"]
+    assert RagService(settings).list_documents().documents[0].chunks == 1
+    assert source.exists()

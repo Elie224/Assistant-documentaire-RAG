@@ -1,26 +1,53 @@
 import hashlib
 import logging
+import re
 import secrets
+import time
+from threading import Lock
 import uuid
 from functools import lru_cache
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
+from app.core.auth import AuthError, authenticate, change_password, login, register, revoke
 from app.core.config import Settings, get_settings
 from app.core.documents import SUPPORTED_EXTENSIONS
 from app.core.exceptions import RagError
 from app.core.rag import RagService
 from app.core.schemas import (
+    AuthResponse,
+    ChangePasswordRequest,
     ChatRequest,
     ChatResponse,
+    DocumentDeletionResponse,
+    DocumentListResponse,
     HealthResponse,
     IngestionResponse,
+    LoginRequest,
+    RegisterRequest,
+    UserResponse,
 )
 
 
 logger = logging.getLogger(__name__)
+
+_AUTH_ATTEMPTS: dict[str, list[float]] = {}
+_AUTH_ATTEMPTS_LOCK = Lock()
+_AUTH_RATE_LIMIT = 10
+_AUTH_RATE_WINDOW = 60.0
+
+
+def _check_auth_rate_limit(request: Request) -> None:
+    key = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    with _AUTH_ATTEMPTS_LOCK:
+        attempts = [stamp for stamp in _AUTH_ATTEMPTS.get(key, []) if now - stamp < _AUTH_RATE_WINDOW]
+        if len(attempts) >= _AUTH_RATE_LIMIT:
+            raise HTTPException(429, "Trop de tentatives. Réessayez dans une minute.")
+        attempts.append(now)
+        _AUTH_ATTEMPTS[key] = attempts
 
 
 def _load_settings() -> Settings:
@@ -37,13 +64,39 @@ app = FastAPI(
 
 def require_api_key(
     x_api_key: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+    x_workspace_id: str | None = Header(default=None, alias="X-Workspace-ID"),
     active_settings: Settings = Depends(_load_settings),
-) -> None:
+) -> tuple[str, str, str] | None:
+    workspace_id = (x_workspace_id or "default").strip()
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+        identity = authenticate(active_settings.project_path(active_settings.auth_db_path), token)
+        if identity is None:
+            raise HTTPException(401, "Session invalide ou expirée.")
+        if workspace_id != identity[2]:
+            raise HTTPException(403, "Accès interdit à ce workspace.")
+        return identity
+    if active_settings.api_key_workspaces:
+        allowed_workspaces = next(
+            (
+                workspaces
+                for configured_key, workspaces in active_settings.api_key_workspaces.items()
+                if x_api_key and secrets.compare_digest(x_api_key, configured_key)
+            ),
+            None,
+        )
+        if allowed_workspaces is None:
+            raise HTTPException(401, "Clé API invalide ou manquante.")
+        if "*" not in allowed_workspaces and workspace_id not in allowed_workspaces:
+            raise HTTPException(403, "Accès interdit à ce workspace.")
+        return None
     if active_settings.api_key is None or not active_settings.api_key.get_secret_value():
-        return
+        return None
     expected = active_settings.api_key.get_secret_value()
     if not x_api_key or not secrets.compare_digest(x_api_key, expected):
         raise HTTPException(401, "Clé API invalide ou manquante.")
+    return None
 
 
 def workspace_settings(
@@ -115,6 +168,91 @@ async def _save_upload(
             temporary.unlink()
 
 
+@app.post("/auth/register", response_model=AuthResponse, status_code=201)
+def auth_register(request: RegisterRequest, http_request: Request, active_settings: Settings = Depends(_load_settings)) -> AuthResponse:
+    _check_auth_rate_limit(http_request)
+    try:
+        user_id, workspace_id = register(
+            active_settings.project_path(active_settings.auth_db_path),
+            request.email,
+            request.password,
+        )
+        token, _, _, expires_in = login(
+            active_settings.project_path(active_settings.auth_db_path),
+            request.email,
+            request.password,
+            active_settings.session_ttl_hours,
+        )
+    except AuthError as error:
+        raise HTTPException(400, str(error)) from error
+    return AuthResponse(
+        access_token=token,
+        expires_in=expires_in,
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+def auth_login(request: LoginRequest, http_request: Request, active_settings: Settings = Depends(_load_settings)) -> AuthResponse:
+    _check_auth_rate_limit(http_request)
+    try:
+        token, user_id, workspace_id, expires_in = login(
+            active_settings.project_path(active_settings.auth_db_path),
+            request.email,
+            request.password,
+            active_settings.session_ttl_hours,
+        )
+    except AuthError as error:
+        raise HTTPException(401, str(error)) from error
+    return AuthResponse(
+        access_token=token,
+        expires_in=expires_in,
+        user_id=user_id,
+        workspace_id=workspace_id,
+    )
+
+
+@app.post("/auth/password", status_code=204)
+def auth_change_password(
+    request: ChangePasswordRequest,
+    identity: tuple[str, str, str] | None = Depends(require_api_key),
+    active_settings: Settings = Depends(_load_settings),
+) -> None:
+    if identity is None:
+        raise HTTPException(401, "Une session Bearer est requise.")
+    try:
+        change_password(
+            active_settings.project_path(active_settings.auth_db_path),
+            identity[0],
+            request.current_password,
+            request.new_password,
+        )
+    except AuthError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.post("/auth/logout", status_code=204)
+def auth_logout(
+    authorization: str | None = Header(default=None),
+    active_settings: Settings = Depends(_load_settings),
+) -> None:
+    if authorization and authorization.lower().startswith("bearer "):
+        revoke(
+            active_settings.project_path(active_settings.auth_db_path),
+            authorization[7:].strip(),
+        )
+
+
+@app.get("/auth/me", response_model=UserResponse)
+def auth_me(
+    identity: tuple[str, str, str] | None = Depends(require_api_key),
+) -> UserResponse:
+    if identity is None:
+        raise HTTPException(401, "Une session Bearer est requise.")
+    return UserResponse(user_id=identity[0], email=identity[1], workspace_id=identity[2])
+
+
 @app.get("/", include_in_schema=False)
 def root() -> dict[str, str]:
     return {"message": settings.app_name, "docs": "/docs"}
@@ -132,6 +270,52 @@ def health(
         llm_provider=active_settings.llm_provider,
         embed_provider=active_settings.embed_provider,
     )
+
+
+@app.get("/documents", response_model=DocumentListResponse)
+async def list_documents(
+    _: None = Depends(require_api_key),
+    active_settings: Settings = Depends(workspace_settings),
+) -> DocumentListResponse:
+    service = get_rag_service(active_settings.workspace_id)
+    return await run_in_threadpool(service.list_documents)
+
+
+@app.post("/documents/{document_id}/reindex", response_model=IngestionResponse)
+async def reindex_document(
+    document_id: str,
+    _: None = Depends(require_api_key),
+    active_settings: Settings = Depends(workspace_settings),
+) -> IngestionResponse:
+    if not re.fullmatch(r"[0-9a-f]{64}", document_id):
+        raise HTTPException(400, "Identifiant documentaire invalide.")
+    service = get_rag_service(active_settings.workspace_id)
+    try:
+        return await run_in_threadpool(service.reindex_document, document_id)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    except RagError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@app.delete(
+    "/documents/{document_id}", response_model=DocumentDeletionResponse
+)
+async def delete_document(
+    document_id: str,
+    _: None = Depends(require_api_key),
+    active_settings: Settings = Depends(workspace_settings),
+) -> DocumentDeletionResponse:
+    if not re.fullmatch(r"[0-9a-f]{64}", document_id):
+        raise HTTPException(400, "Identifiant documentaire invalide.")
+    service = get_rag_service(active_settings.workspace_id)
+    try:
+        response = await run_in_threadpool(service.delete_document, document_id)
+    except (RagError, ValueError) as error:
+        raise HTTPException(400, str(error)) from error
+    if not response.deleted:
+        raise HTTPException(404, "Document introuvable.")
+    return response
 
 
 @app.post("/documents/ingest", response_model=IngestionResponse)

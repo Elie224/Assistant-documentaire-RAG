@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from app.core.rag import (
@@ -37,3 +38,27 @@ def test_registry_deduplicates_same_content_with_different_names(tmp_path: Path)
 def test_registry_creates_interprocess_lock_file(tmp_path: Path) -> None:
     with _registry_transaction(tmp_path):
         assert (tmp_path / ".indexed_files.lock").exists()
+
+
+def test_legacy_json_registry_is_migrated_to_sqlite(tmp_path: Path) -> None:
+    legacy = tmp_path / "indexed_files.json"
+    legacy.write_text(
+        json.dumps({"abc": ["guide.txt"]}, ensure_ascii=False), encoding="utf-8"
+    )
+
+    registry = _load_registry(tmp_path)
+
+    assert registry == {"abc": ["guide.txt"]}
+    assert _registry_path(tmp_path).name == "documents.sqlite3"
+    assert _registry_path(tmp_path).exists()
+
+
+def test_legacy_registry_is_not_restored_after_deletion(tmp_path: Path) -> None:
+    legacy = tmp_path / "indexed_files.json"
+    legacy.write_text(json.dumps({"abc": ["guide.txt"]}), encoding="utf-8")
+    assert _load_registry(tmp_path) == {"abc": ["guide.txt"]}
+
+    with _registry_transaction(tmp_path) as registry:
+        registry.clear()
+
+    assert _load_registry(tmp_path) == {}

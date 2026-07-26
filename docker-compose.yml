@@ -8,6 +8,9 @@ services:
       EMBED_PROVIDER: ${EMBED_PROVIDER:-local-lite}
       VECTOR_STORE: ${VECTOR_STORE:-chroma}
       RAG_API_KEY: ${RAG_API_KEY:-}
+      AUTH_DB_PATH: ${AUTH_DB_PATH:-./data/auth.sqlite3}
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-24}
+      RAG_API_KEY_WORKSPACES: ${RAG_API_KEY_WORKSPACES:-{}}
     ports:
       - "8000:8000"
     volumes:
