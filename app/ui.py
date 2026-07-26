@@ -8,8 +8,14 @@ API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
 
 def api_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
     key = os.getenv("RAG_UI_API_KEY")
-    return {"X-API-Key": key} if key else {}
+    workspace = os.getenv("RAG_WORKSPACE_ID", "default").strip()
+    if key:
+        headers["X-API-Key"] = key
+    if workspace:
+        headers["X-Workspace-ID"] = workspace
+    return headers
 
 
 SUGGESTIONS = [
@@ -399,7 +405,9 @@ def render_sources(sources: list[dict]) -> None:
             if source.get("page"):
                 metadata.append(f"Page {source['page']}")
             if source.get("score") is not None:
-                metadata.append(f"Pertinence {source['score']:.0%}")
+                metadata.append(f"Classement {source['score']:.0%}")
+            if source.get("confidence") is not None:
+                metadata.append(f"Confiance {source['confidence']:.0%}")
             preview = source.get("preview") or source.get("content") or "Extrait indisponible."
             with st.container(border=True):
                 st.markdown(f"**{position:02d} · {source_name}**")

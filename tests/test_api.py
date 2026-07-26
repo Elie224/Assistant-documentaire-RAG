@@ -61,3 +61,12 @@ def test_upload_path_is_partitioned_by_content_hash() -> None:
 
     assert destination.name == "contrat.pdf"
     assert destination.parent.name == "abc123"
+
+
+def test_workspace_header_is_validated() -> None:
+    client = _with_api_key(None)
+    try:
+        assert client.get("/health", headers={"X-Workspace-ID": "team-a"}).status_code == 200
+        assert client.get("/health", headers={"X-Workspace-ID": "../other"}).status_code == 400
+    finally:
+        _reset_overrides()

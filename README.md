@@ -136,6 +136,7 @@ Changez de modèle Claude avec `ANTHROPIC_MODEL`, de modèle OpenAI avec `LLM_MO
 - `POST /chat` : répond à une question avec les extraits sources ;
 - `GET /docs` : interface Swagger générée automatiquement.
 
+L'API accepte l'en-tête optionnel `X-Workspace-ID`. Sa valeur par défaut est `default`, qui conserve les chemins historiques. Pour un workspace personnalisé, les uploads et index sont isolés dans des sous-dossiers dédiés. L'interface Streamlit transmet `RAG_WORKSPACE_ID` automatiquement.
 Exemple de question :
 
 ```powershell

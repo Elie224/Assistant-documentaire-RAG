@@ -48,3 +48,21 @@ def test_anthropic_key_is_required() -> None:
 def test_overlap_must_be_smaller_than_chunk_size() -> None:
     with pytest.raises(ValueError, match="CHUNK_OVERLAP"):
         Settings(chunk_size=200, chunk_overlap=200)
+
+
+def test_workspace_isolates_custom_index_and_upload_paths(tmp_path: Path) -> None:
+    settings = Settings(
+        vector_store="chroma",
+        rag_engine="langchain",
+        chroma_dir=tmp_path / "index",
+        raw_data_dir=tmp_path / "raw",
+    ).for_workspace("team-a")
+
+    assert settings.workspace_id == "team-a"
+    assert settings.isolated_index_dir.parts[-3:] == ("langchain", "team-a", "local-lite")
+    assert settings.uploads_dir == tmp_path / "raw" / "team-a"
+
+
+def test_workspace_id_rejects_path_traversal() -> None:
+    with pytest.raises(ValueError, match="workspace"):
+        Settings().for_workspace("../other")

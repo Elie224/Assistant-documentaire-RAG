@@ -17,6 +17,7 @@ class SourceChunk(BaseModel):
     source: str
     page: int | None = None
     score: float | None = None
+    confidence: float | None = None
     preview: str
     content: str = ""
 

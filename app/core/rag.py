@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import os
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
@@ -87,15 +88,58 @@ def _lock_for(index_dir: Path) -> Lock:
 
 
 @contextmanager
+def _file_registry_lock(index_dir: Path, max_wait: float):
+    index_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = index_dir / ".indexed_files.lock"
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        deadline = time.monotonic() + max_wait
+        acquired = False
+        while time.monotonic() < deadline:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except OSError:
+                time.sleep(0.05)
+        if not acquired:
+            raise RuntimeError("Registre index occupé, réessayez.")
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
 def _registry_transaction(index_dir: Path, max_wait: float = 5.0):
-    """Verrou court sur le registre avec écriture atomique."""
+    """Transaction du registre protégée entre threads et processus."""
     lock = _lock_for(index_dir)
     if not lock.acquire(timeout=max_wait):
         raise RuntimeError("Registre index occupé, réessayez.")
     try:
-        registry = _load_registry(index_dir)
-        yield registry
-        _save_registry(index_dir, registry)
+        with _file_registry_lock(index_dir, max_wait):
+            registry = _load_registry(index_dir)
+            yield registry
+            _save_registry(index_dir, registry)
     finally:
         lock.release()
 
@@ -139,14 +183,34 @@ def _split_new_paths(
     return kept, pairs
 
 
+def _record_registry_entries(
+    registry: dict[str, list[str]], pairs: list[tuple[Path, str]]
+) -> None:
+    for path, digest in pairs:
+        names = registry.setdefault(digest, [])
+        if path.name not in names:
+            names.append(path.name)
+
+
 def _record_files(index_dir: Path, pairs: list[tuple[Path, str]]) -> None:
     if not pairs:
         return
     with _registry_transaction(index_dir) as registry:
-        for path, digest in pairs:
-            names = registry.setdefault(digest, [])
-            if path.name not in names:
-                names.append(path.name)
+        _record_registry_entries(registry, pairs)
+
+
+def _document_confidence(document, score: float | None) -> float | None:
+    confidence = document.metadata.get("_retrieval_confidence")
+    if confidence is None and score is not None and 0 <= score <= 1:
+        confidence = score
+    return float(confidence) if confidence is not None else None
+
+
+def _annotate_vector_confidence(results: list[tuple]) -> None:
+    for document, score in results:
+        confidence = _document_confidence(document, score)
+        if confidence is not None:
+            document.metadata["_retrieval_confidence"] = confidence
 
 
 def _filter_sources(
@@ -155,7 +219,11 @@ def _filter_sources(
     return [
         source
         for source in sources
-        if _score_is_allowed(source.score, threshold, allow_unscored)
+        if _score_is_allowed(
+            source.confidence if source.confidence is not None else source.score,
+            threshold,
+            allow_unscored,
+        )
     ]
 
 
@@ -173,7 +241,9 @@ def _filter_scored_results(
     return [
         (document, score)
         for document, score in results
-        if _score_is_allowed(score, threshold, allow_unscored)
+        if _score_is_allowed(
+            _document_confidence(document, score), threshold, allow_unscored
+        )
     ]
 
 
@@ -210,6 +280,7 @@ class LangChainBackend:
                 for doc in store.similarity_search(question, k=candidate_k)
             ]
 
+        _annotate_vector_confidence(vector_results)
         if not self.settings.hybrid_search:
             return vector_results[: self.settings.top_k]
 
@@ -260,42 +331,42 @@ class LangChainBackend:
     def ingest(self, paths: list[Path]) -> IngestionResponse:
         from app.core.providers import get_langchain_embeddings
 
-        kept, pairs = _split_new_paths(paths, _load_registry(self._base_dir()))
-        if not kept:
-            return IngestionResponse(
-                files=[],
-                chunks=0,
-                engine=self.settings.rag_engine,
-                vector_store=self.settings.vector_store,
-            )
-        documents = load_documents(kept)
-        chunks = split_documents(documents, self.settings)
-        if not chunks:
-            raise ValueError("Les documents ne contiennent aucun texte exploitable.")
-
         index_dir = self._ensure_dir()
-        index_dir.mkdir(parents=True, exist_ok=True)
-        if self.settings.vector_store == "chroma":
-            store = self._store()
-            store.add_documents(chunks)
-        else:
-            from langchain_community.vectorstores import FAISS
+        with _registry_transaction(index_dir) as registry:
+            kept, pairs = _split_new_paths(paths, registry)
+            if not kept:
+                return IngestionResponse(
+                    files=[],
+                    chunks=0,
+                    engine=self.settings.rag_engine,
+                    vector_store=self.settings.vector_store,
+                )
+            documents = load_documents(kept)
+            chunks = split_documents(documents, self.settings)
+            if not chunks:
+                raise ValueError("Les documents ne contiennent aucun texte exploitable.")
 
-            embeddings = get_langchain_embeddings(self.settings)
-            if (index_dir / "index.faiss").exists():
+            if self.settings.vector_store == "chroma":
                 store = self._store()
                 store.add_documents(chunks)
             else:
-                store = FAISS.from_documents(chunks, embeddings)
-            store.save_local(str(index_dir))
+                from langchain_community.vectorstores import FAISS
 
-        _record_files(index_dir, pairs)
-        return IngestionResponse(
-            files=[path.name for path in kept],
-            chunks=len(chunks),
-            engine=self.settings.rag_engine,
-            vector_store=self.settings.vector_store,
-        )
+                embeddings = get_langchain_embeddings(self.settings)
+                if (index_dir / "index.faiss").exists():
+                    store = self._store()
+                    store.add_documents(chunks)
+                else:
+                    store = FAISS.from_documents(chunks, embeddings)
+                store.save_local(str(index_dir))
+
+            _record_registry_entries(registry, pairs)
+            return IngestionResponse(
+                files=[path.name for path in kept],
+                chunks=len(chunks),
+                engine=self.settings.rag_engine,
+                vector_store=self.settings.vector_store,
+            )
 
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse:
         from app.core.providers import get_langchain_llm
@@ -319,6 +390,7 @@ class LangChainBackend:
                     source=str(document.metadata.get("source", "Document inconnu")),
                     page=_page_number(document.metadata),
                     score=round(float(score), 4) if score is not None else None,
+                    confidence=_document_confidence(document, score),
                     preview=text[:500],
                     content=text,
                 )
@@ -405,35 +477,36 @@ class LlamaIndexBackend:
     def ingest(self, paths: list[Path]) -> IngestionResponse:
         from llama_index.core.schema import TextNode
 
-        kept, pairs = _split_new_paths(paths, _load_registry(self._base_dir()))
-        if not kept:
+        index_dir = self._ensure_dir()
+        with _registry_transaction(index_dir) as registry:
+            kept, pairs = _split_new_paths(paths, registry)
+            if not kept:
+                return IngestionResponse(
+                    files=[],
+                    chunks=0,
+                    engine=self.settings.rag_engine,
+                    vector_store=self.settings.vector_store,
+                )
+            documents = load_documents(kept)
+            chunks = split_documents(documents, self.settings)
+            if not chunks:
+                raise ValueError("Les documents ne contiennent aucun texte exploitable.")
+
+            index = self._index(create=True)
+            nodes = [
+                TextNode(text=chunk.page_content, metadata=dict(chunk.metadata))
+                for chunk in chunks
+            ]
+            index.insert_nodes(nodes)
+            if self.settings.vector_store == "faiss":
+                index.storage_context.persist(persist_dir=str(self._base_dir()))
+            _record_registry_entries(registry, pairs)
             return IngestionResponse(
-                files=[],
-                chunks=0,
+                files=[path.name for path in kept],
+                chunks=len(chunks),
                 engine=self.settings.rag_engine,
                 vector_store=self.settings.vector_store,
             )
-        documents = load_documents(kept)
-        chunks = split_documents(documents, self.settings)
-        if not chunks:
-            raise ValueError("Les documents ne contiennent aucun texte exploitable.")
-
-        self._ensure_dir()
-        index = self._index(create=True)
-        nodes = [
-            TextNode(text=chunk.page_content, metadata=dict(chunk.metadata))
-            for chunk in chunks
-        ]
-        index.insert_nodes(nodes)
-        if self.settings.vector_store == "faiss":
-            index.storage_context.persist(persist_dir=str(self._base_dir()))
-        _record_files(self._base_dir(), pairs)
-        return IngestionResponse(
-            files=[path.name for path in kept],
-            chunks=len(chunks),
-            engine=self.settings.rag_engine,
-            vector_store=self.settings.vector_store,
-        )
 
     def retrieve(self, question: str) -> list[tuple]:
         index = self._index()
@@ -474,6 +547,7 @@ class LlamaIndexBackend:
                     source=str(metadata.get("source", "Document inconnu")),
                     page=_page_number(metadata),
                     score=round(float(score), 4) if score is not None else None,
+                    confidence=_document_confidence(source_node.node, score),
                     preview=text[:500],
                     content=text,
                 )
@@ -536,6 +610,25 @@ def _bm25_search(
     return [(documents[index], float(score)) for index, score in indexed if score > 0]
 
 
+def _retrieval_key(document) -> str:
+    return hashlib.sha1(document.page_content.encode("utf-8")).hexdigest()
+
+
+def _evidence_by_key(results: list[tuple]) -> dict[str, float]:
+    scored = [
+        (_retrieval_key(document), float(score))
+        for document, score in results
+        if score is not None
+    ]
+    if not scored:
+        return {}
+    values = [score for _, score in scored]
+    low, high = min(values), max(values)
+    if high - low < 1e-9:
+        return {key: 1.0 if score > 0 else 0.0 for key, score in scored}
+    return {key: (score - low) / (high - low) for key, score in scored}
+
+
 def _hybrid_retrieve(
     question: str,
     vector_results: list[tuple],
@@ -544,37 +637,58 @@ def _hybrid_retrieve(
     bm25_weight: float,
 ) -> list[tuple]:
     del question
-    seen: dict[str, tuple[float, object]] = {}
+    seen: dict[str, tuple[float, object, float | None]] = {}
     vector_weight = 1.0 - bm25_weight
     rrf_constant = 60
+    vector_evidence = _evidence_by_key(vector_results)
+    bm25_evidence = _evidence_by_key(bm25_results)
 
     for rank, (document, _) in enumerate(vector_results, start=1):
-        key = hashlib.sha1(document.page_content.encode("utf-8")).hexdigest()
-        current_score, current_document = seen.get(key, (0.0, document))
+        key = _retrieval_key(document)
+        current_score, current_document, current_confidence = seen.get(
+            key, (0.0, document, None)
+        )
+        confidence = max(
+            [value for value in (current_confidence, vector_evidence.get(key)) if value is not None],
+            default=None,
+        )
         seen[key] = (
             current_score + vector_weight / (rrf_constant + rank),
             current_document,
+            confidence,
         )
 
     for rank, (document, _) in enumerate(bm25_results, start=1):
-        key = hashlib.sha1(document.page_content.encode("utf-8")).hexdigest()
-        current_score, current_document = seen.get(key, (0.0, document))
+        key = _retrieval_key(document)
+        current_score, current_document, current_confidence = seen.get(
+            key, (0.0, document, None)
+        )
+        confidence = max(
+            [value for value in (current_confidence, bm25_evidence.get(key)) if value is not None],
+            default=None,
+        )
         seen[key] = (
             current_score + bm25_weight / (rrf_constant + rank),
             current_document,
+            confidence,
         )
 
     ranked = sorted(seen.values(), key=lambda item: item[0], reverse=True)
     if not ranked:
         return []
 
-    scores = [score for score, _ in ranked]
+    scores = [score for score, _, _ in ranked]
     low, high = min(scores), max(scores)
     if high - low < 1e-9:
         normalized = [1.0] * len(ranked)
     else:
         normalized = [(score - low) / (high - low) for score in scores]
-    return [
-        (document, round(score, 4))
-        for score, (_, document) in zip(normalized[:top_k], ranked[:top_k])
-    ]
+
+    results = []
+    for rank_score, (_, document, confidence) in zip(
+        normalized[:top_k], ranked[:top_k]
+    ):
+        if confidence is not None:
+            document.metadata["_retrieval_confidence"] = round(confidence, 4)
+        results.append((document, round(rank_score, 4)))
+    return results

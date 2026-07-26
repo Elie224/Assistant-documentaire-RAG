@@ -32,3 +32,8 @@ def test_registry_deduplicates_same_content_with_different_names(tmp_path: Path)
     kept, pairs = _split_new_paths([second], {digest: [first.name]})
     assert kept == []
     assert pairs == []
+
+
+def test_registry_creates_interprocess_lock_file(tmp_path: Path) -> None:
+    with _registry_transaction(tmp_path):
+        assert (tmp_path / ".indexed_files.lock").exists()

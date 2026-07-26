@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
@@ -17,6 +18,12 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Assistant RAG"
+    workspace_id: str = Field(
+        default="default",
+        min_length=1,
+        max_length=64,
+        pattern=r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}",
+    )
     rag_engine: Literal["langchain", "llamaindex"] = "langchain"
     llm_provider: Literal["anthropic", "openai", "ollama"] = "anthropic"
     embed_provider: Literal["semantic", "local-lite", "openai", "ollama"] = "local-lite"
@@ -69,12 +76,24 @@ class Settings(BaseSettings):
 
     @property
     def isolated_index_dir(self) -> Path:
-        """Chemin d'index incluant moteur, vector store et provider d'embeddings."""
-        return self.index_dir / self.embed_provider
+        """Chemin d'index isolé par workspace, moteur et provider d'embeddings."""
+        base = self.index_dir
+        if self.workspace_id != "default":
+            base /= self.workspace_id
+        return base / self.embed_provider
 
     @property
     def uploads_dir(self) -> Path:
-        return self.project_path(self.raw_data_dir)
+        base = self.project_path(self.raw_data_dir)
+        if self.workspace_id != "default":
+            base /= self.workspace_id
+        return base
+
+    def for_workspace(self, workspace_id: str | None) -> "Settings":
+        value = (workspace_id or "default").strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
+            raise ValueError("Identifiant de workspace invalide.")
+        return self.model_copy(update={"workspace_id": value})
 
     def openai_key(self) -> str:
         if self.openai_api_key is None or not self.openai_api_key.get_secret_value():
