@@ -444,6 +444,9 @@ for key, default in {
         st.session_state[key] = default
 
 api_online, config = get_api_health()
+ui_request_headers = api_headers()
+auth_configured = bool(ui_request_headers.get("X-API-Key") or ui_request_headers.get("Authorization"))
+auth_blocked = bool(api_online and config.get("auth_required") and not auth_configured)
 provider_names = {
     "anthropic": "Claude",
     "openai": "OpenAI",
@@ -479,7 +482,7 @@ with st.sidebar:
                     <div class="status-dot online"></div>
                     <div>
                         <div class="connection-title">API disponible</div>
-                        <div class="connection-meta">Authentification requise (RAG_UI_API_KEY)</div>
+                        <div class="connection-meta">Authentification requise (RAG_UI_API_KEY / RAG_API_KEY)</div>
                     </div>
                 </div>
                 """,
@@ -537,7 +540,7 @@ with st.sidebar:
         "Indexer les documents",
         icon=":material/upload_file:",
         type="primary",
-        disabled=not uploads or not api_online,
+        disabled=not uploads or not api_online or auth_blocked,
         width="stretch",
     ):
         upload_payloads = []
@@ -557,7 +560,7 @@ with st.sidebar:
                 listed = requests.get(
                     f"{API_URL}/documents",
                     timeout=30,
-                    headers=api_headers(),
+                    headers=ui_request_headers,
                 )
                 if not listed.ok:
                     status.update(label="Synchronisation interrompue", state="error")
@@ -577,7 +580,7 @@ with st.sidebar:
                     deletion = requests.delete(
                         f"{API_URL}/documents/{document_id}",
                         timeout=60,
-                        headers=api_headers(),
+                        headers=ui_request_headers,
                     )
                     if not deletion.ok:
                         status.update(label="Nettoyage interrompu", state="error")
@@ -589,7 +592,7 @@ with st.sidebar:
                     f"{API_URL}/documents/ingest",
                     files=payload,
                     timeout=300,
-                    headers=api_headers(),
+                    headers=ui_request_headers,
                 )
                 if response.ok:
                     result = response.json()
@@ -659,7 +662,7 @@ if not api_online:
     )
 elif config.get("auth_required"):
     st.info(
-        "L'API est en ligne, mais l'authentification est requise. Configurez RAG_UI_API_KEY pour interroger l'assistant.",
+        "L'API est en ligne, mais l'authentification est requise. Configurez RAG_UI_API_KEY (ou RAG_API_KEY dans .env) pour interroger l'assistant.",
         icon=":material/key:",
     )
 
@@ -696,7 +699,7 @@ if not st.session_state.messages:
                 icon=icon,
                 key=f"suggestion-{prompt}",
                 width="stretch",
-                disabled=not api_online,
+                disabled=not api_online or auth_blocked,
             ):
                 suggested_question = prompt
 else:
@@ -706,7 +709,7 @@ else:
 typed_question = st.chat_input(
     "Posez une question sur vos documents…",
     max_chars=4000,
-    disabled=not api_online,
+    disabled=not api_online or auth_blocked,
 )
 question = typed_question or suggested_question
 
@@ -726,7 +729,7 @@ if question:
                     f"{API_URL}/chat",
                     json={"question": question, "history": history},
                     timeout=180,
-                    headers=api_headers(),
+                    headers=ui_request_headers,
                 )
                 if response.ok:
                     result = response.json()
