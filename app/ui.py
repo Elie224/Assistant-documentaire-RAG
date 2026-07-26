@@ -1,5 +1,6 @@
 import os
 import hashlib
+from pathlib import Path
 
 import requests
 import streamlit as st
@@ -14,11 +15,36 @@ API_URL = os.getenv(
 ).rstrip("/")
 
 
+def _env_file_api_key() -> str | None:
+    env_path = _SETTINGS.project_path(Path(".env"))
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if not line or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "RAG_API_KEY":
+                raw = value.strip().strip('"').strip("'")
+                return raw or None
+    except OSError:
+        return None
+    return None
+
+
+def _resolved_api_key() -> str | None:
+    # Priority: explicit UI env var, settings-loaded key, raw .env fallback.
+    key = os.getenv("RAG_UI_API_KEY")
+    if key:
+        return key
+    if _SETTINGS.api_key is not None:
+        loaded = _SETTINGS.api_key.get_secret_value()
+        if loaded:
+            return loaded
+    return _env_file_api_key()
+
+
 def api_headers() -> dict[str, str]:
     headers: dict[str, str] = {}
-    key = os.getenv("RAG_UI_API_KEY")
-    if not key and _SETTINGS.api_key is not None:
-        key = _SETTINGS.api_key.get_secret_value()
+    key = _resolved_api_key()
     workspace = os.getenv("RAG_WORKSPACE_ID", _SETTINGS.workspace_id).strip()
     if key:
         headers["X-API-Key"] = key
@@ -381,7 +407,7 @@ st.markdown(
 
 def api_error(response: requests.Response) -> str:
     if response.status_code == 401:
-        return "Accès refusé par l'API. Vérifiez la clé RAG_UI_API_KEY."
+        return "Accès refusé par l'API. Vérifiez la clé RAG_UI_API_KEY ou RAG_API_KEY."
     if response.status_code >= 500:
         return "Le service documentaire rencontre un problème. Réessayez dans quelques instants."
     try:
@@ -395,10 +421,11 @@ def get_api_health() -> tuple[bool, dict]:
     try:
         response = requests.get(f"{API_URL}/health", timeout=3, headers=api_headers())
         if response.status_code == 401:
-            # Retry with explicit .env key in case the process does not expose RAG_UI_API_KEY.
-            if _SETTINGS.api_key is not None and _SETTINGS.api_key.get_secret_value():
+            # Retry with explicit key fallback read from .env.
+            fallback_key = _resolved_api_key()
+            if fallback_key:
                 retry_headers = {
-                    "X-API-Key": _SETTINGS.api_key.get_secret_value(),
+                    "X-API-Key": fallback_key,
                     "X-Workspace-ID": os.getenv("RAG_WORKSPACE_ID", _SETTINGS.workspace_id).strip() or "default",
                 }
                 retry = requests.get(
