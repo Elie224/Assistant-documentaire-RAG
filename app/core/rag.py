@@ -10,7 +10,7 @@ import time
 import uuid
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from threading import Lock
+from threading import Condition, Lock
 from typing import Iterable, Protocol
 
 from app.core.config import Settings, get_settings
@@ -198,6 +198,10 @@ def _connect_registry(index_dir: Path) -> sqlite3.Connection:
             value TEXT NOT NULL
         )"""
     )
+    connection.execute(
+        """CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts
+           USING fts5(document_id UNINDEXED, source UNINDEXED, content)"""
+    )
     return connection
 
 
@@ -247,6 +251,10 @@ def _save_registry(index_dir: Path, registry: dict[str, list[str]]) -> None:
         if removed:
             connection.executemany(
                 "DELETE FROM documents WHERE document_id = ?",
+                [(document_id,) for document_id in removed],
+            )
+            connection.executemany(
+                "DELETE FROM chunks_fts WHERE document_id = ?",
                 [(document_id,) for document_id in removed],
             )
         chunk_counts = getattr(registry, "chunk_counts", {})
@@ -361,6 +369,71 @@ def _context_json_payload(scored_documents: list[tuple]) -> str:
             }
         )
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _index_chunks_for_fts(index_dir: Path, chunks: list) -> None:
+    rows = [
+        (
+            str(chunk.metadata.get("document_id", "")),
+            str(chunk.metadata.get("source", "Document inconnu")),
+            chunk.page_content.strip(),
+        )
+        for chunk in chunks
+        if chunk.page_content and chunk.metadata.get("document_id")
+    ]
+    if not rows:
+        return
+    with _connect_registry(index_dir) as connection:
+        connection.executemany(
+            "INSERT INTO chunks_fts (document_id, source, content) VALUES (?, ?, ?)",
+            rows,
+        )
+        connection.commit()
+
+
+def _delete_document_from_fts(index_dir: Path, document_id: str) -> None:
+    with _connect_registry(index_dir) as connection:
+        connection.execute("DELETE FROM chunks_fts WHERE document_id = ?", (document_id,))
+        connection.commit()
+
+
+def _fts_search(index_dir: Path, question: str, top_k: int) -> list[tuple]:
+    from langchain_core.documents import Document
+
+    tokens = _tokenize(question)
+    if not tokens:
+        return []
+    query = " OR ".join(f'"{token.replace("\"", "")}"' for token in tokens[:20])
+    try:
+        with _connect_registry(index_dir) as connection:
+            rows = connection.execute(
+                """SELECT document_id, source, content, bm25(chunks_fts) AS rank
+                   FROM chunks_fts
+                   WHERE chunks_fts MATCH ?
+                   ORDER BY rank
+                   LIMIT ?""",
+                (query, top_k),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+    results = []
+    for document_id, source, content, rank in rows:
+        score = 1.0 / (1.0 + max(float(rank), 0.0))
+        results.append(
+            (
+                Document(
+                    page_content=content or "",
+                    metadata={
+                        "document_id": document_id,
+                        "source": source or "Document inconnu",
+                        "_retrieval_confidence": score,
+                    },
+                ),
+                score,
+            )
+        )
+    return results
 
 
 def _collect_langchain_documents(store, vector_store: str) -> list:
@@ -483,6 +556,7 @@ def _restore_langchain_snapshot(
     store.add_documents(snapshot)
     if vector_store == "faiss":
         store.save_local(str(index_dir))
+    _index_chunks_for_fts(index_dir, snapshot)
 
 
 def _remove_llamaindex_document_ids(
@@ -622,11 +696,13 @@ class LangChainBackend:
 
         if not vector_results:
             return []
-        try:
-            corpus = _collect_langchain_documents(store, self.settings.vector_store)
-            bm25_results = _bm25_search(question, corpus, candidate_k)
-        except Exception:
-            return vector_results[: self.settings.top_k]
+        bm25_results = _fts_search(self._base_dir(), question, candidate_k)
+        if not bm25_results:
+            try:
+                corpus = _collect_langchain_documents(store, self.settings.vector_store)
+                bm25_results = _bm25_search(question, corpus, candidate_k)
+            except Exception:
+                return vector_results[: self.settings.top_k]
         if not bm25_results:
             return vector_results[: self.settings.top_k]
         return _hybrid_retrieve(
@@ -738,6 +814,7 @@ class LangChainBackend:
                 if chunk.metadata.get("document_id") in accepted_ids
             ]
             _record_registry_entries(registry, accepted_pairs, accepted_chunks)
+            _index_chunks_for_fts(index_dir, accepted_chunks)
             return IngestionResponse(
                 files=[path.name for path, _ in accepted_pairs],
                 chunks=len(accepted_chunks),
@@ -783,6 +860,7 @@ class LangChainBackend:
                     store.save_local(str(index_dir))
 
             registry.pop(document_id)
+            _delete_document_from_fts(index_dir, document_id)
             if remove_upload:
                 _remove_uploaded_document(self.settings, document_id, names)
         return DocumentDeletionResponse(document_id=document_id, deleted=True)
@@ -966,6 +1044,7 @@ class LlamaIndexBackend:
                 if chunk.metadata.get("document_id") in accepted_ids
             ]
             _record_registry_entries(registry, accepted_pairs, accepted_chunks)
+            _index_chunks_for_fts(index_dir, accepted_chunks)
             return IngestionResponse(
                 files=[path.name for path, _ in accepted_pairs],
                 chunks=len(accepted_chunks),
@@ -995,6 +1074,7 @@ class LlamaIndexBackend:
             if self.settings.vector_store == "faiss":
                 index.storage_context.persist(persist_dir=str(index_dir))
             registry.pop(document_id)
+            _delete_document_from_fts(index_dir, document_id)
             if remove_upload:
                 _remove_uploaded_document(self.settings, document_id, names)
         return DocumentDeletionResponse(document_id=document_id, deleted=True)
@@ -1075,27 +1155,27 @@ class RagService:
             else LlamaIndexBackend
         )
         self.backend: RagBackend = backend_class(self.settings)
-        self._lock = Lock()
+        self._lock = _ReadWriteLock()
 
     def ingest(self, paths: list[Path]) -> IngestionResponse:
-        with self._lock:
+        with self._lock.write_lock():
             return self.backend.ingest(paths)
 
     def ask(self, question: str, history: list[ChatMessage]) -> ChatResponse:
-        with self._lock:
+        with self._lock.read_lock():
             return self.backend.ask(question, history)
 
 
     def list_documents(self) -> DocumentListResponse:
-        with self._lock:
+        with self._lock.read_lock():
             return self.backend.list_documents()
 
     def delete_document(self, document_id: str) -> DocumentDeletionResponse:
-        with self._lock:
+        with self._lock.write_lock():
             return self.backend.delete_document(document_id)
 
     def reindex_document(self, document_id: str) -> IngestionResponse:
-        with self._lock:
+        with self._lock.write_lock():
             listing = self.backend.list_documents()
             document = next(
                 (item for item in listing.documents if item.document_id == document_id),
@@ -1143,6 +1223,41 @@ class RagService:
                 raise ValueError(
                     "La réindexation a échoué; restauration automatique tentée."
                 ) from error
+
+
+class _ReadWriteLock:
+    def __init__(self) -> None:
+        self._state_lock = Lock()
+        self._condition = Condition(self._state_lock)
+        self._readers = 0
+        self._writer = False
+
+    @contextmanager
+    def read_lock(self):
+        with self._condition:
+            while self._writer:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def write_lock(self):
+        with self._condition:
+            while self._writer or self._readers > 0:
+                self._condition.wait()
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer = False
+                self._condition.notify_all()
 
 
 _BM25_TOKEN_PATTERN = re.compile(r"\b[\wÀ-ÿ'-]+\b", re.UNICODE)
