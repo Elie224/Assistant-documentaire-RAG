@@ -348,17 +348,21 @@ def _set_document_statuses(
 def _split_new_paths(
     paths: list[Path], registry: dict[str, list[str]]
 ) -> tuple[list[Path], list[tuple[Path, str]]]:
-    """Return (kept paths, hash pairs) skipping already-indexed content."""
+    """Return (kept paths, hash pairs) while allowing repair of empty registry entries."""
     kept: list[Path] = []
     pairs: list[tuple[Path, str]] = []
     seen: set[str] = set()
+    chunk_counts = getattr(registry, "chunk_counts", None)
     for path in paths:
         digest = _file_hash(path)
         if digest in seen:
             continue
         seen.add(digest)
         if digest in registry:
-            continue
+            # Keep a previously-registered file only when it has no chunks,
+            # so a fresh ingest can repair a corrupted/empty entry.
+            if chunk_counts is None or chunk_counts.get(digest, 1) > 0:
+                continue
         kept.append(path)
         pairs.append((path, digest))
     return kept, pairs
@@ -860,13 +864,18 @@ class LangChainBackend:
 
         with _registry_transaction(index_dir) as registry:
             duplicate_ids = {digest for _, digest in pairs if digest in registry}
+            reparable_ids = {
+                digest
+                for digest in duplicate_ids
+                if getattr(registry, "chunk_counts", {}).get(digest, 0) <= 0
+            }
             duplicate_operation_ids = {operation_ids[digest] for digest in duplicate_ids}
             if duplicate_ids:
                 logger.warning(
                     "Conflit d'ingestion LangChain détecté pour %s.",
                     sorted(duplicate_ids),
                 )
-            accepted_ids = inserted_ids - duplicate_ids
+            accepted_ids = inserted_ids - (duplicate_ids - reparable_ids)
             if not accepted_ids:
                 accepted_pairs = []
                 accepted_chunks = []
@@ -1108,12 +1117,17 @@ class LlamaIndexBackend:
 
         with _registry_transaction(index_dir) as registry:
             duplicate_ids = {digest for _, digest in pairs if digest in registry}
+            reparable_ids = {
+                digest
+                for digest in duplicate_ids
+                if getattr(registry, "chunk_counts", {}).get(digest, 0) <= 0
+            }
             if duplicate_ids:
                 logger.warning(
                     "Conflit d'ingestion LlamaIndex détecté pour %s: nettoyage vectoriel ignoré pour éviter une suppression destructive.",
                     sorted(duplicate_ids),
                 )
-            accepted_ids = inserted_ids - duplicate_ids
+            accepted_ids = inserted_ids - (duplicate_ids - reparable_ids)
             if not accepted_ids:
                 _set_document_statuses(index_dir, inserted_ids, "failed")
                 return IngestionResponse(

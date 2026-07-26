@@ -15,6 +15,7 @@ from app.core.rag import (
     _file_hash,
     _load_registry,
     _record_files,
+    _registry_transaction,
     _split_new_paths,
 )
 
@@ -92,13 +93,16 @@ def test_llamaindex_backend_ingests_and_answers(
 def test_duplicate_files_are_skipped(tmp_path: Path) -> None:
     source = tmp_path / "policy.txt"
     source.write_text("allocation", encoding="utf-8")
+    digest = _file_hash(source)
     registry = _load_registry(tmp_path)
     kept, pairs = _split_new_paths([source], registry)
     assert kept and pairs
     _record_files(tmp_path, pairs)
+    with _registry_transaction(tmp_path) as updated_registry:
+        updated_registry.chunk_counts[digest] = 1
     again, _ = _split_new_paths([source], _load_registry(tmp_path))
     assert not again
-    assert _file_hash(source)
+    assert digest
 
 
 def test_llamaindex_generation_uses_filtered_nodes_once(

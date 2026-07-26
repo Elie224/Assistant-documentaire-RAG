@@ -35,6 +35,21 @@ def test_registry_deduplicates_same_content_with_different_names(tmp_path: Path)
     assert pairs == []
 
 
+def test_split_new_paths_keeps_zero_chunk_entries_for_repair(tmp_path: Path) -> None:
+    source = tmp_path / "attestation.txt"
+    source.write_text("Texte présent", encoding="utf-8")
+    digest = _file_hash(source)
+
+    with _registry_transaction(tmp_path) as registry:
+        registry[digest] = [source.name]
+        registry.chunk_counts[digest] = 0
+
+    kept, pairs = _split_new_paths([source], _load_registry(tmp_path))
+
+    assert kept == [source]
+    assert pairs == [(source, digest)]
+
+
 def test_registry_creates_interprocess_lock_file(tmp_path: Path) -> None:
     with _registry_transaction(tmp_path):
         assert (tmp_path / ".indexed_files.lock").exists()
