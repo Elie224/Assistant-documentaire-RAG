@@ -221,3 +221,32 @@ def test_local_lite_unscored_irrelevant_results_are_rejected(
 
     assert response.sources == []
     assert recording_llm.prompts == []
+
+
+def test_local_lite_generic_document_question_uses_relaxed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.documents import Document
+
+    recording_llm = RecordingLLM()
+    monkeypatch.setattr(
+        "app.core.providers.get_langchain_llm", lambda settings: recording_llm
+    )
+    settings = Settings(
+        llm_provider="ollama",
+        embed_provider="local-lite",
+        score_threshold=0.25,
+        local_embed_dimension=128,
+    )
+    backend = LangChainBackend(settings)
+    document = Document(
+        page_content="Ce document présente une attestation de réussite universitaire.",
+        metadata={"source": "attestation.pdf", "_retrieval_confidence": 0.08},
+    )
+    backend.retrieve = lambda question: [(document, None)]
+
+    response = backend.ask("tu penses quoi du doc", [])
+
+    assert response.sources
+    assert response.sources[0].source == "attestation.pdf"
+    assert recording_llm.prompts

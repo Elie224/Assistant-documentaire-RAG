@@ -737,6 +737,28 @@ def _no_answer_response(settings: Settings) -> ChatResponse:
     )
 
 
+def _is_generic_document_question(question: str) -> bool:
+    tokens = _tokenize(question)
+    if not tokens:
+        return False
+    generic_markers = {
+        "doc",
+        "docs",
+        "document",
+        "documents",
+        "fichier",
+        "fichiers",
+        "pdf",
+        "texte",
+        "contenu",
+        "resume",
+        "résumé",
+        "penses",
+        "avis",
+    }
+    return len(tokens) <= 10 and any(token in generic_markers for token in tokens)
+
+
 class LangChainBackend:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -970,6 +992,19 @@ class LangChainBackend:
             self.settings.score_threshold,
             allow_unscored=False,
         )
+        if (
+            not filtered_scored
+            and scored
+            and self.settings.embed_provider == "local-lite"
+            and _is_generic_document_question(question)
+        ):
+            # Local-lite hashing can under-score broad questions (e.g. "que penses-tu du doc").
+            # Fall back to best retrieved chunks instead of returning an immediate no-answer.
+            filtered_scored = _filter_scored_results(
+                scored,
+                threshold=0.0,
+                allow_unscored=True,
+            )[: self.settings.top_k]
         if not filtered_scored:
             return _no_answer_response(self.settings)
 
